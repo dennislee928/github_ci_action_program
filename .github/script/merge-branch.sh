@@ -41,7 +41,7 @@ v_log() {
 # Human-readable duration for step timing logs (e.g. "30 min", "2 min 15s", "45s", "1h 5m").
 format_duration_human() {
   local s="${1:-0}"
-  [[ "${s//[^0-9]/}" != "$s" ]] && s=0
+  [[ "$s" =~ ^[0-9]+$ ]] || s=0
   [[ "$s" -lt 0 ]] && s=0
   if [[ "$s" -ge 3600 ]]; then
     echo "$((s / 3600))h $(((s % 3600) / 60))m"
@@ -202,13 +202,13 @@ search_prs_for_owner_namespace() {
   local owner_ns="$1"
   local limit="${2:-300}"
   local use_author="${3:-0}"
-  local raw="" t0 t1 n search_ec=0
+  local raw="" chunk="" t0 t_end n search_ec=0
   local tout="${GH_SEARCH_TIMEOUT_SEC:-0}"
 
+  t0=$SECONDS
   if [[ "$use_author" == "1" ]]; then
-    echo "==> Searching PRs: author=${MY_LOGIN} owner=${owner_ns} (non-draft) ..." >&2
+    echo "==> Searching PRs: author=${MY_LOGIN} owner=${owner_ns} (non-draft) …" >&2
     v_log "gh search prs --author ${MY_LOGIN} --owner ${owner_ns} --limit ${limit} (timeout=${tout}s)"
-    t0=$SECONDS
     gh_heartbeat_start "author ${MY_LOGIN} owner ${owner_ns}"
     set +e
     raw=$(run_with_timeout_sec "$tout" gh search prs --author "$MY_LOGIN" --owner "$owner_ns" --state open --draft=false \
@@ -216,13 +216,21 @@ search_prs_for_owner_namespace() {
     search_ec=$?
     set -e
     gh_heartbeat_stop
-    t1=$SECONDS
-    n=$(normalize_gh_search_json "$raw" | jq 'length')
-    v_log "author+owner=${owner_ns} done in $((t1 - t0))s — PRs: ${n} exit=${search_ec}"
+    if [[ "$search_ec" -eq 124 ]]; then
+      t_end=$SECONDS
+      echo "error: gh search timed out for namespace ${owner_ns} (GH_SEARCH_TIMEOUT_SEC=${tout})." >&2
+      echo "==> Searching PRs: author=${MY_LOGIN} owner=${owner_ns} (non-draft) … : used $(format_duration_human $((t_end - t0))) — 0 PR(s), gh exit ${search_ec}" >&2
+      echo '[]'
+      return 0
+    fi
+    chunk=$(normalize_gh_search_json "$raw")
+    n=$(echo "$chunk" | jq 'length')
+    t_end=$SECONDS
+    v_log "author+owner=${owner_ns} — PRs: ${n} exit=${search_ec} wall=$((t_end - t0))s"
+    echo "==> Searching PRs: author=${MY_LOGIN} owner=${owner_ns} (non-draft) … : used $(format_duration_human $((t_end - t0))) — ${n} PR(s), gh exit ${search_ec}" >&2
   else
-    echo "==> Searching open PRs: owner=${owner_ns} (non-draft) ..." >&2
+    echo "==> Searching open PRs: owner=${owner_ns} (non-draft) …" >&2
     v_log "gh search prs --owner ${owner_ns} --limit ${limit} (timeout=${tout}s)"
-    t0=$SECONDS
     gh_heartbeat_start "owner ${owner_ns}"
     set +e
     raw=$(run_with_timeout_sec "$tout" gh search prs --owner "$owner_ns" --state open --draft=false \
@@ -230,17 +238,21 @@ search_prs_for_owner_namespace() {
     search_ec=$?
     set -e
     gh_heartbeat_stop
-    t1=$SECONDS
-    n=$(normalize_gh_search_json "$raw" | jq 'length')
-    v_log "owner=${owner_ns} done in $((t1 - t0))s — PRs: ${n} exit=${search_ec}"
+    if [[ "$search_ec" -eq 124 ]]; then
+      t_end=$SECONDS
+      echo "error: gh search timed out for namespace ${owner_ns} (GH_SEARCH_TIMEOUT_SEC=${tout})." >&2
+      echo "==> Searching open PRs: owner=${owner_ns} (non-draft) … : used $(format_duration_human $((t_end - t0))) — 0 PR(s), gh exit ${search_ec}" >&2
+      echo '[]'
+      return 0
+    fi
+    chunk=$(normalize_gh_search_json "$raw")
+    n=$(echo "$chunk" | jq 'length')
+    t_end=$SECONDS
+    v_log "owner=${owner_ns} — PRs: ${n} exit=${search_ec} wall=$((t_end - t0))s"
+    echo "==> Searching open PRs: owner=${owner_ns} (non-draft) … : used $(format_duration_human $((t_end - t0))) — ${n} PR(s), gh exit ${search_ec}" >&2
   fi
 
-  if [[ "$search_ec" -eq 124 ]]; then
-    echo "error: gh search timed out for namespace ${owner_ns} (GH_SEARCH_TIMEOUT_SEC=${tout})." >&2
-    echo '[]'
-    return 0
-  fi
-  normalize_gh_search_json "$raw" | jq 'unique_by(.url)'
+  echo "$chunk" | jq 'unique_by(.url)'
 }
 
 merge_pull_requests_from_json() {
@@ -250,6 +262,7 @@ merge_pull_requests_from_json() {
   local method="$4"
   local only_sast="$5"
 
+  local phase_t0=$SECONDS
   local count
   count=$(echo "$json" | jq 'length')
   echo "==> ${phase_label} — ${count} PR(s) to evaluate" >&2
@@ -339,6 +352,9 @@ merge_pull_requests_from_json() {
       v_log "merge attempt exit=${merge_ec} repo=${repo_full} num=${num}"
     fi
   done < <(echo "$json" | jq -c '.[]')
+
+  local phase_t1=$SECONDS
+  echo "==> ${phase_label} … : used $(format_duration_human $((phase_t1 - phase_t0))) (merge / skip pass)" >&2
 }
 
 # On PR head branch: merge origin/base with -X ours so conflict hunks keep the PR (tool) side.
@@ -412,7 +428,11 @@ merge_all_pull_requests() {
     exit 1
   }
 
+  local _run_t0=$SECONDS
+  local _ident_t0=$SECONDS
   load_allowed_owners
+  local _ident_t1=$SECONDS
+  echo "==> Step timing — gh api user + orgs list … : used $(format_duration_human $((_ident_t1 - _ident_t0)))" >&2
 
   local limit="${PR_LIMIT:-300}"
   local dry="${DRY_RUN:-0}"
@@ -448,7 +468,9 @@ merge_all_pull_requests() {
     merge_pull_requests_from_json "$json" "Phase 2 — org ${org}" "$dry" "$method" "$only_sast"
   done
 
+  local _run_t1=$SECONDS
   echo ""
+  echo "==> Step timing — total sast-prs run … : used $(format_duration_human $((_run_t1 - _run_t0)))" >&2
   echo "Done."
 }
 
@@ -466,6 +488,7 @@ if [[ "${1:-}" == "sast-prs" ]] || [[ "${MERGE_SAST_PRS:-}" == "1" ]]; then
   fi
   export MERGE_SCRIPT_VERBOSE
   export GH_HEARTBEAT_SEC="${GH_HEARTBEAT_SEC:-3}"
+  export MERGE_SEARCH_PROGRESS_SEC="${MERGE_SEARCH_PROGRESS_SEC:-15}"
   merge_branch_start_session_log "merge-branch-$(date '+%Y%m%d-%H%M%S').log"
   merge_all_pull_requests
   exit 0
