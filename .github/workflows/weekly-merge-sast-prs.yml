@@ -16,6 +16,8 @@ name: Weekly PR merge automation
 
 on:
   workflow_dispatch:
+  # 若改由 Cloudflare Worker cron 觸發（見 .github/script/cloudflare_workers/），
+  # 可註解掉下方 schedule，避免與 Workers 重複執行。
   schedule:
     # Every Monday 09:00 UTC; adjust as needed.
     - cron: "0 9 * * 1"

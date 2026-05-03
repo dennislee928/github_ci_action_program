@@ -1,0 +1,22 @@
+# Cloudflare Worker：每週兩次觸發 GitHub Actions workflow_dispatch，
+# 實際合併仍由 .github/workflows/weekly-merge-sast-prs.yml 執行 merge-branch.sh。
+#
+# 部署前請設定：
+#   wrangler secret put GITHUB_TOKEN
+#     → Classic PAT：repo + workflow；或 Fine-grained：Repository permissions Contents/Metadata read，
+#       Actions read/write（需能 dispatch 此 workflow）。
+#   並確認下方 [vars] 的 GITHUB_REPO / 分支正確。
+#
+# 排程：每週一、四 09:00 UTC（請依需求改 crons）。
+
+name = "merge-sast-prs-cron"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+[vars]
+GITHUB_REPO = "YOUR_ORG/github_ci_action_program"
+WORKFLOW_FILE = "weekly-merge-sast-prs.yml"
+DEFAULT_BRANCH = "main"
+
+[triggers]
+crons = ["0 9 * * 1", "0 9 * * 4"]

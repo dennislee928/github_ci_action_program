@@ -18,6 +18,21 @@
 
 set -euo pipefail
 
+# #region agent log
+DEBUG_LOG="/Users/dennis_leedennis_lee/Documents/GitHub/github_ci_action_program/.cursor/debug-268be4.log"
+_agent_dbg() {
+  local hid="$1" loc="$2" msg="$3" dat="$4"
+  { jq -nc \
+    --arg sid "268be4" \
+    --arg hid "$hid" \
+    --arg loc "$loc" \
+    --arg msg "$msg" \
+    --arg dat "$dat" \
+    '{sessionId:$sid,hypothesisId:$hid,location:$loc,message:$msg,data:{detail:$dat},timestamp:(now|floor)}' \
+    >>"$DEBUG_LOG" 2>/dev/null; } || printf '%s\n' "{\"sessionId\":\"268be4\",\"hypothesisId\":\"$hid\",\"location\":\"$loc\",\"message\":\"$msg\",\"data\":{\"detail\":\"encode_fail\"},\"timestamp\":0}" >>"$DEBUG_LOG"
+}
+# #endregion
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -82,24 +97,61 @@ collect_open_prs_in_namespaces() {
   local limit="${1:-100}"
   local combined='[]'
   local raw chunk q
+  local _jq_err
+
+  _agent_dbg "H5" "merge-branch.sh:collect_start" "environment" "jq=$(jq --version 2>&1 | tr '\n' ' ') bash=${BASH_VERSION}"
 
   # GitHub: exclude drafts with "-draft:true" (do not use "is:draft:false"; it can break the query).
   echo "==> Searching open PRs: user:${MY_LOGIN} (excluding drafts) ..."
   q="is:open is:pr -draft:true user:${MY_LOGIN}"
   raw=$(gh search prs "$q" --json number,title,url,repository --limit "$limit" 2>/dev/null) || raw=''
+  _agent_dbg "H1" "merge-branch.sh:raw_user" "gh_search_stdout_preview" "${raw:0:500}"
   chunk=$(normalize_gh_search_json "$raw")
-  combined=$(jq -n --argjson a "$combined" --argjson b "$chunk" '$a + $b')
+  local _cz=0
+  [[ -z "$chunk" ]] && _cz=1
+  _agent_dbg "H2" "merge-branch.sh:chunk_after_normalize_user" "chunk_meta" "len=${#chunk} empty=${_cz} preview=${chunk:0:300}"
+
+  _jq_err=$(mktemp)
+  if ! combined=$(jq -n --argjson a "$combined" --argjson b "$chunk" '$a + $b' 2>"$_jq_err"); then
+    _agent_dbg "H3" "merge-branch.sh:combine_user_fail" "jq_stderr" "$(cat "$_jq_err" | tr '\n' ' '| cut -c1-400)"
+    cat "$_jq_err" >&2
+    rm -f "$_jq_err"
+    exit 1
+  fi
+  rm -f "$_jq_err"
 
   local org
   for org in "${MY_ORGS[@]}"; do
     echo "==> Searching open PRs: org:${org} (excluding drafts) ..."
     q="is:open is:pr -draft:true org:${org}"
     raw=$(gh search prs "$q" --json number,title,url,repository --limit "$limit" 2>/dev/null) || raw=''
+    _agent_dbg "H1" "merge-branch.sh:raw_org" "org_search" "org=${org} preview=${raw:0:400}"
     chunk=$(normalize_gh_search_json "$raw")
-    combined=$(jq -n --argjson a "$combined" --argjson b "$chunk" '$a + $b')
+    _agent_dbg "H2" "merge-branch.sh:chunk_org" "chunk_meta" "org=${org} len=${#chunk} preview=${chunk:0:200}"
+
+    _jq_err=$(mktemp)
+    if ! combined=$(jq -n --argjson a "$combined" --argjson b "$chunk" '$a + $b' 2>"$_jq_err"); then
+      _agent_dbg "H3" "merge-branch.sh:combine_org_fail" "jq_stderr org=${org}" "$(cat "$_jq_err" | tr '\n' ' '| cut -c1-400)"
+      cat "$_jq_err" >&2
+      rm -f "$_jq_err"
+      exit 1
+    fi
+    rm -f "$_jq_err"
   done
 
-  echo "$combined" | jq 'unique_by(.url)'
+  _agent_dbg "H4" "merge-branch.sh:before_unique" "combined_meta" "len=${#combined} preview=${combined:0:400}"
+
+  local _uout
+  _uout=$(mktemp)
+  _jq_err=$(mktemp)
+  if ! echo "$combined" | jq 'unique_by(.url)' >"$_uout" 2>"$_jq_err"; then
+    _agent_dbg "H4" "merge-branch.sh:unique_by_fail" "jq_stderr" "$(cat "$_jq_err" | tr '\n' ' '| cut -c1-400)"
+    cat "$_jq_err" >&2
+    rm -f "$_jq_err" "$_uout"
+    exit 1
+  fi
+  cat "$_uout"
+  rm -f "$_jq_err" "$_uout"
 }
 
 # On PR head branch: merge origin/base with -X ours so conflict hunks keep the PR (tool) side.
