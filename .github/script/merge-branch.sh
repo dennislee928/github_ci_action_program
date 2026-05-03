@@ -24,6 +24,27 @@ v_log() {
   echo "[verbose $(date '+%H:%M:%S')] $*" >&2
 }
 
+# While `raw=$(gh search prs ...)` runs, the shell prints nothing. Heartbeat every 8s in verbose mode.
+_GH_HB_PID=
+gh_heartbeat_start() {
+  [[ "${MERGE_SCRIPT_VERBOSE:-0}" == "1" ]] || return 0
+  (
+    local n=0
+    while sleep 8; do
+      n=$((n + 1))
+      echo "[verbose $(date '+%H:%M:%S')] still waiting for GitHub: $* … (${n}×8s elapsed)" >&2
+    done
+  ) &
+  _GH_HB_PID=$!
+}
+
+gh_heartbeat_stop() {
+  [[ -z "${_GH_HB_PID:-}" ]] && return 0
+  kill "$_GH_HB_PID" 2>/dev/null || true
+  wait "$_GH_HB_PID" 2>/dev/null || true
+  _GH_HB_PID=
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -96,10 +117,13 @@ collect_open_prs_in_namespaces() {
   # user:LOGIN / -draft:true often return [] even when the web UI lists PRs.
   # Progress must go to stderr — stdout is only the final JSON array for json=$(...) capture.
   echo "==> Searching open PRs: owner=${MY_LOGIN} (non-draft) ..." >&2
+  echo "    Note: each gh search blocks until the API returns (no new lines). Many open PRs → 30s–2m is normal." >&2
   v_log "gh search prs --owner ${MY_LOGIN} --limit ${limit} (calling GitHub API…)"
   t0=$SECONDS
+  gh_heartbeat_start "owner ${MY_LOGIN}"
   raw=$(gh search prs --owner "$MY_LOGIN" --state open --draft=false \
     --json number,title,url,repository --limit "$limit" 2>/dev/null) || raw=''
+  gh_heartbeat_stop
   t1=$SECONDS
   chunk=$(normalize_gh_search_json "$raw")
   n=$(echo "$chunk" | jq 'length')
@@ -111,8 +135,10 @@ collect_open_prs_in_namespaces() {
     echo "==> Searching open PRs: owner=${org} (non-draft) ..." >&2
     v_log "gh search prs --owner ${org} --limit ${limit} (calling GitHub API…)"
     t0=$SECONDS
+    gh_heartbeat_start "owner ${org}"
     raw=$(gh search prs --owner "$org" --state open --draft=false \
       --json number,title,url,repository --limit "$limit" 2>/dev/null) || raw=''
+    gh_heartbeat_stop
     t1=$SECONDS
     chunk=$(normalize_gh_search_json "$raw")
     n=$(echo "$chunk" | jq 'length')
