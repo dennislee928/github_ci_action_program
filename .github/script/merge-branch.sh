@@ -304,12 +304,12 @@ merge_pull_requests_from_json() {
       continue
     fi
 
-    if ! gh pr view "$num" --repo "$repo_full" --json mergeable &>/dev/null; then
+    local _pr_json
+    if ! _pr_json=$(gh pr view "$num" --repo "$repo_full" --json mergeable 2>/dev/null); then
       echo "skip: cannot view PR (no access?)"
       continue
     fi
-
-    mergeable=$(gh pr view "$num" --repo "$repo_full" --json mergeable -q .mergeable)
+    mergeable=$(echo "$_pr_json" | jq -r '.mergeable // "UNKNOWN"')
     v_log "PR ${repo_full}#${num} mergeable=${mergeable}"
 
     if [[ "$mergeable" == "UNKNOWN" ]]; then
@@ -351,6 +351,7 @@ merge_pull_requests_from_json() {
       echo "skip/error: merge failed or script error on ${repo_full}#${num} (exit ${merge_ec}). Try MERGE_ADMIN=1 or fix CI." >&2
       v_log "merge attempt exit=${merge_ec} repo=${repo_full} num=${num}"
     fi
+    sleep "${MERGE_INTER_PR_SLEEP:-1}"  # avoid GitHub API rate-limiting between sequential merges
   done < <(echo "$json" | jq -c '.[]')
 
   local phase_t1=$SECONDS
@@ -373,16 +374,22 @@ resolve_sast_conflicts_via_git() {
   local clone_url="https://x-access-token:${token}@github.com/${repo_full}.git"
   local workdir
   workdir=$(mktemp -d)
-  trap 'rm -rf "${workdir}"' RETURN
 
   echo "==> Clone PR head branch ${head_branch} (shallow) ..."
-  git clone --depth=80 --branch "$head_branch" "$clone_url" "$workdir"
+  # Trap is set after clone so a clone failure can do explicit cleanup and return 1
+  # (set -e is suppressed when this function is called in an `if` context).
+  if ! git clone --depth=200 --branch "$head_branch" "$clone_url" "$workdir" 2>&1; then
+    echo "error: git clone failed (check token permissions or branch name)" >&2
+    rm -rf "$workdir"
+    return 1
+  fi
+  trap 'rm -rf "${workdir}"' RETURN
   pushd "$workdir" >/dev/null
 
   git config user.email "${GIT_AUTHOR_EMAIL:-$(gh api user -q .email 2>/dev/null || echo "${MY_LOGIN}@users.noreply.github.com")}"
   git config user.name "${GIT_AUTHOR_NAME:-$MY_LOGIN}"
 
-  git fetch origin "$base_branch" --depth=80
+  git fetch origin "$base_branch" --depth=200
 
   echo "==> Merge origin/${base_branch} into ${head_branch} favoring PR branch (-X ours) ..."
   if ! git merge "origin/${base_branch}" -m "Merge ${base_branch} into ${head_branch} (automated: favor PR branch on conflicts)" -X ours; then

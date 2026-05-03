@@ -23,7 +23,8 @@ on:
     - cron: "0 9 * * 1"
 
 permissions:
-  contents: read
+  contents: write        # needed for git push in conflict resolution
+  pull-requests: write   # needed for gh pr merge / gh pr review via GITHUB_TOKEN
 
 concurrency:
   group: weekly-pr-merge
