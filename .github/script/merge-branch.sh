@@ -9,7 +9,7 @@
 #
 # PR mode: Phase 1 — open PRs under your user (owner=LOGIN), then Phase 2 — each org
 # (owner=ORG). Optional MERGE_SEARCH_BY_AUTHOR=1 scopes searches with --author LOGIN
-# (same idea as web “author:”). De-duplicates per phase, then merges when allowed.
+# (same idea as web "author:"). De-duplicates per phase, then merges when allowed.
 # Non-SAST PRs: merge only when GitHub reports no conflicts.
 # SAST titles (Snyk/Semgrep/Husky/CodeRabbit): if mergeable, merge; if conflicting,
 # merges base into the PR branch locally with strategy "ours" (keep PR / tool side),
@@ -197,54 +197,54 @@ normalize_gh_search_json() {
 }
 
 # One `gh search prs` for a single repo owner namespace. When use_author=1, restricts to
-# PRs authored by MY_LOGIN (--author + --owner), matching the web “author:” experience.
+# PRs authored by MY_LOGIN (--author + --owner), matching the web "author:" experience.
 # Prints JSON array on stdout; progress on stderr.
 search_prs_for_owner_namespace() {
-  local owner_ns=”$1”
-  local limit=”${2:-300}”
-  local use_author=”${3:-0}”
-  local raw=”” chunk=”” t0 t_end n search_ec=0
-  local tout=”${GH_SEARCH_TIMEOUT_SEC:-0}”
-  local label author_arg=””
+  local owner_ns="$1"
+  local limit="${2:-300}"
+  local use_author="${3:-0}"
+  local raw="" chunk="" t0 t_end n search_ec=0
+  local tout="${GH_SEARCH_TIMEOUT_SEC:-0}"
+  local label author_arg=""
 
-  if [[ “$use_author” == “1” ]]; then
-    label=”author=${MY_LOGIN} owner=${owner_ns}”
-    author_arg=”$MY_LOGIN”
+  if [[ "$use_author" == "1" ]]; then
+    label="author=${MY_LOGIN} owner=${owner_ns}"
+    author_arg="$MY_LOGIN"
   else
-    label=”owner=${owner_ns}”
+    label="owner=${owner_ns}"
   fi
 
   t0=$SECONDS
-  echo “==> Searching PRs: ${label} (non-draft) …” >&2
-  v_log “gh search prs ${author_arg:+--author $author_arg} --owner ${owner_ns} --limit ${limit} (timeout=${tout}s)”
-  gh_heartbeat_start “${label}”
+  echo "==> Searching PRs: ${label} (non-draft) …" >&2
+  v_log "gh search prs ${author_arg:+--author $author_arg} --owner ${owner_ns} --limit ${limit} (timeout=${tout}s)"
+  gh_heartbeat_start "${label}"
   set +e
-  if [[ -n “$author_arg” ]]; then
-    raw=$(run_with_timeout_sec “$tout” gh search prs --author “$author_arg” \
-      --owner “$owner_ns” --state open --draft=false \
-      --json number,title,url,repository --limit “$limit” 2>/dev/null)
+  if [[ -n "$author_arg" ]]; then
+    raw=$(run_with_timeout_sec "$tout" gh search prs --author "$author_arg" \
+      --owner "$owner_ns" --state open --draft=false \
+      --json number,title,url,repository --limit "$limit" 2>/dev/null)
   else
-    raw=$(run_with_timeout_sec “$tout” gh search prs \
-      --owner “$owner_ns” --state open --draft=false \
-      --json number,title,url,repository --limit “$limit” 2>/dev/null)
+    raw=$(run_with_timeout_sec "$tout" gh search prs \
+      --owner "$owner_ns" --state open --draft=false \
+      --json number,title,url,repository --limit "$limit" 2>/dev/null)
   fi
   search_ec=$?
   set -e
   gh_heartbeat_stop
 
   t_end=$SECONDS
-  if [[ “$search_ec” -eq 124 ]]; then
-    echo “error: gh search timed out for namespace ${owner_ns} (GH_SEARCH_TIMEOUT_SEC=${tout}).” >&2
-    echo “==> Searching PRs: ${label} … : used $(format_duration_human $((t_end - t0))) — 0 PR(s), gh exit ${search_ec}” >&2
+  if [[ "$search_ec" -eq 124 ]]; then
+    echo "error: gh search timed out for namespace ${owner_ns} (GH_SEARCH_TIMEOUT_SEC=${tout})." >&2
+    echo "==> Searching PRs: ${label} … : used $(format_duration_human $((t_end - t0))) — 0 PR(s), gh exit ${search_ec}" >&2
     echo '[]'
     return 0
   fi
 
-  chunk=$(normalize_gh_search_json “$raw”)
-  n=$(echo “$chunk” | jq 'length')
-  v_log “${label} — PRs: ${n} exit=${search_ec} wall=$((t_end - t0))s”
-  echo “==> Searching PRs: ${label} … : used $(format_duration_human $((t_end - t0))) — ${n} PR(s), gh exit ${search_ec}” >&2
-  echo “$chunk” | jq 'unique_by(.url)'
+  chunk=$(normalize_gh_search_json "$raw")
+  n=$(echo "$chunk" | jq 'length')
+  v_log "${label} — PRs: ${n} exit=${search_ec} wall=$((t_end - t0))s"
+  echo "==> Searching PRs: ${label} … : used $(format_duration_human $((t_end - t0))) — ${n} PR(s), gh exit ${search_ec}" >&2
+  echo "$chunk" | jq 'unique_by(.url)'
 }
 
 merge_pull_requests_from_json() {
