@@ -1,8 +1,8 @@
 # Runs .github/script/merge-branch.sh sast-prs on a timer.
 #
-# Script behavior (see script comments): open PRs under user:<you> + each org (non-draft);
-# merge when GitHub says mergeable. Non-SAST PRs are skipped if conflicting. SAST-like
-# titles get git conflict resolution (-X ours on PR branch) then merge.
+# Script behavior (see script comments): Phase 1 — PRs under your user namespace, then
+# Phase 2 — each org (non-draft). Optional MERGE_SEARCH_BY_AUTHOR=1 adds --author (your PRs only).
+# Merge when GitHub says mergeable; GH_SEARCH_TIMEOUT_SEC caps each search (e.g. 120).
 #
 # Optional secret SAST_MERGE_GITHUB_TOKEN: PAT so gh/git can merge PRs in other repos
 # (classic "repo" + read:org, or fine-grained on those repos). Without it, Actions
@@ -45,6 +45,8 @@ jobs:
           # Optional overrides for scheduled/manual runs (edit here or use repo Variables).
           # MERGE_ONLY_SAST: "1"
           # DRY_RUN: "1"
+          # GH_SEARCH_TIMEOUT_SEC: "120"
+          # MERGE_SEARCH_BY_AUTHOR: "1"
         run: |
           set -euo pipefail
           if [ -n "${PAT:-}" ]; then
