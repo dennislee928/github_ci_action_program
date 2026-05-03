@@ -38,16 +38,44 @@ v_log() {
   echo "[verbose $(date '+%H:%M:%S')] $*" >&2
 }
 
-# While `raw=$(gh search prs ...)` runs, the shell prints nothing. Optional heartbeat (default 3s).
+# Human-readable duration for step timing logs (e.g. "30 min", "2 min 15s", "45s", "1h 5m").
+format_duration_human() {
+  local s="${1:-0}"
+  [[ "${s//[^0-9]/}" != "$s" ]] && s=0
+  [[ "$s" -lt 0 ]] && s=0
+  if [[ "$s" -ge 3600 ]]; then
+    echo "$((s / 3600))h $(((s % 3600) / 60))m"
+  elif [[ "$s" -ge 60 ]]; then
+    local m=$((s / 60))
+    local r=$((s % 60))
+    if [[ "$r" -eq 0 ]]; then
+      echo "${m} min"
+    else
+      echo "${m} min ${r}s"
+    fi
+  else
+    echo "${s}s"
+  fi
+}
+
+# While `raw=$(gh search prs ...)` runs, print periodic lines to stderr.
+# Verbose: GH_HEARTBEAT_SEC (default 3s). Non-verbose: MERGE_SEARCH_PROGRESS_SEC (default 15s); set to 0 to disable.
 _GH_HB_PID=
 gh_heartbeat_start() {
-  [[ "${MERGE_SCRIPT_VERBOSE:-0}" == "1" ]] || return 0
-  local every="${GH_HEARTBEAT_SEC:-3}"
+  local every kill_msg prefix
+  if [[ "${MERGE_SCRIPT_VERBOSE:-0}" == "1" ]]; then
+    every="${GH_HEARTBEAT_SEC:-3}"
+    prefix="verbose"
+  else
+    every="${MERGE_SEARCH_PROGRESS_SEC:-15}"
+    prefix="progress"
+    [[ "$every" == "0" ]] && return 0
+  fi
   (
     local n=0
     while sleep "$every"; do
       n=$((n + 1))
-      echo "[verbose $(date '+%H:%M:%S')] still waiting for GitHub: $* … (${n}×${every}s elapsed)" >&2
+      echo "[${prefix} $(date '+%H:%M:%S')] still waiting for GitHub: $* … (${n}×${every}s elapsed)" >&2
     done
   ) &
   _GH_HB_PID=$!
@@ -77,11 +105,14 @@ run_with_timeout_sec() {
     gtimeout "$max_wait" "$@"
     return $?
   fi
+  # macOS / no coreutils: run child then force-deadline (TERM, then KILL) so `gh` cannot hang past max_wait.
   "$@" &
   local pid=$!
   (
     sleep "$max_wait"
     kill -TERM "$pid" 2>/dev/null || true
+    sleep 3
+    kill -KILL "$pid" 2>/dev/null || true
   ) &
   local killer=$!
   wait "$pid"
@@ -112,7 +143,8 @@ Environment (PR mode):
   PR_LIMIT=300        Per search query cap (default 300)
   MERGE_ONLY_SAST=1   Only process PRs whose title matches SAST keywords (legacy)
   VERBOSE=2 / 100 / yes  All enable verbose (not only VERBOSE=1)
-  GH_HEARTBEAT_SEC=3  Seconds between "still waiting for GitHub" lines (default 3)
+  GH_HEARTBEAT_SEC=3  Verbose: seconds between heartbeat lines during gh search (default 3)
+  MERGE_SEARCH_PROGRESS_SEC   Non-verbose: heartbeat interval during gh search (default 15; 0 = off)
   GH_SEARCH_TIMEOUT_SEC   Seconds; caps each gh search prs call (0/unset = no cap). Ex: 120
   MERGE_SEARCH_BY_AUTHOR=1  Add --author LOGIN to each search (your PRs only), still scoped per owner phase
   MERGE_LOG_FILE=path   Write full session log to this file (default: .github/script/merge-branch-*.log)
