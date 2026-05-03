@@ -81,21 +81,22 @@ normalize_gh_search_json() {
 collect_open_prs_in_namespaces() {
   local limit="${1:-100}"
   local combined='[]'
-  local raw chunk q
+  local raw chunk
 
-  # GitHub: exclude drafts with "-draft:true" (do not use "is:draft:false"; it can break the query).
+  # Use gh structured flags (--owner, --draft=false). Free-text queries like
+  # user:LOGIN / -draft:true often return [] even when the web UI lists PRs.
   # Progress must go to stderr — stdout is only the final JSON array for json=$(...) capture.
-  echo "==> Searching open PRs: user:${MY_LOGIN} (excluding drafts) ..." >&2
-  q="is:open is:pr -draft:true user:${MY_LOGIN}"
-  raw=$(gh search prs "$q" --json number,title,url,repository --limit "$limit" 2>/dev/null) || raw=''
+  echo "==> Searching open PRs: owner=${MY_LOGIN} (non-draft) ..." >&2
+  raw=$(gh search prs --owner "$MY_LOGIN" --state open --draft=false \
+    --json number,title,url,repository --limit "$limit" 2>/dev/null) || raw=''
   chunk=$(normalize_gh_search_json "$raw")
   combined=$(jq -n --argjson a "$combined" --argjson b "$chunk" '$a + $b')
 
   local org
   for org in "${MY_ORGS[@]}"; do
-    echo "==> Searching open PRs: org:${org} (excluding drafts) ..." >&2
-    q="is:open is:pr -draft:true org:${org}"
-    raw=$(gh search prs "$q" --json number,title,url,repository --limit "$limit" 2>/dev/null) || raw=''
+    echo "==> Searching open PRs: owner=${org} (non-draft) ..." >&2
+    raw=$(gh search prs --owner "$org" --state open --draft=false \
+      --json number,title,url,repository --limit "$limit" 2>/dev/null) || raw=''
     chunk=$(normalize_gh_search_json "$raw")
     combined=$(jq -n --argjson a "$combined" --argjson b "$chunk" '$a + $b')
   done
