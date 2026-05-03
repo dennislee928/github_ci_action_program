@@ -1,202 +1,276 @@
 #!/usr/bin/env bash
-# 快速合併：一次 gh search 列出「你開的」open PR → 僅當 mergeable=MERGEABLE 時執行 merge（預設帶 --admin 等同強制）。
-# 其餘狀態略過並寫 log（stdout／可選 FAST_MERGE_LOG）。
+# fast-merge-mergeable-prs.sh
+# Purpose: Rapidly merge ALL MERGEABLE open PRs authored by you as fast as possible.
 #
-# chmod a+x .github/script/fast-merge-mergeable-prs.sh
-# .github/script/fast-merge-mergeable-prs.sh
+# Strategy (optimised for speed):
+#   1. Single gh search prs — collect all your open non-draft PRs.
+#   2. PARALLEL workers run concurrently; each does ONE gh pr view call to check
+#      mergeability, then immediately merges if MERGEABLE.
+#   3. Anything not MERGEABLE is logged as SKIP — no retry, no conflict resolution.
+#   4. Results are printed in order after every batch of PARALLEL workers finishes.
+#
+# Usage:
+#   .github/script/fast-merge-mergeable-prs.sh
+#   DRY_RUN=1 .github/script/fast-merge-mergeable-prs.sh
 #
 # Environment:
-#   PR_LIMIT=500            gh search 每筆查詢上限（預設 500；GitHub 全域搜尋約 1000）
-#   MERGE_METHOD=merge      merge | squash | rebase
-#   MERGE_ADMIN=1           預設 1：gh pr merge --admin（需對該 repo 有足夠權限才會成功）
-#   MERGE_ADMIN=0           不帶 --admin
-#   DELETE_BRANCH=1         合併後刪除 head branch
-#   DRY_RUN=1               只列出將 merge / skip，不執行 merge
-#   GH_SEARCH_TIMEOUT_SEC   搜尋逾時秒數；預設 120。設為 0 = 不限（可能卡住很久）
-#   FAST_MERGE_LOG=path     可選；附加寫入每行結果（SKIP／MERGED／ERROR）
+#   PR_LIMIT=500                Max PRs from gh search (default 500)
+#   MERGE_METHOD=merge          merge | squash | rebase (default merge)
+#   MERGE_ADMIN=1               Pass --admin to gh pr merge (default 1)
+#   DELETE_BRANCH=1             Delete head branch after merge (default 0)
+#   DRY_RUN=1                   List what would be merged; no actual merges
+#   PARALLEL=6                  Concurrent check+merge workers (default 6)
+#   GH_SEARCH_TIMEOUT_SEC=120   gh search timeout in seconds (default 120; 0=no limit)
+#   FAST_MERGE_LOG=path         Append MERGED/SKIP/ERROR lines to this file too
+#   FAST_MERGE_PROGRESS_SEC=15  Search heartbeat interval (default 15; 0=off)
 #
-# Requires: gh, jq. Auth: gh auth login or GH_TOKEN.
+# Requires: gh, jq. Auth: gh auth login or GH_TOKEN env var.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# ── helpers ───────────────────────────────────────────────────────────────────
+
 log_line() {
-  local msg="$1"
-  printf '%s\n' "$msg"
-  # Never exit on log append (set -e): env FAST_MERGE_LOG may point to a bad path.
+  printf '%s\n' "$1"
   if [[ -n "${FAST_MERGE_LOG:-}" ]]; then
-    printf '%s\n' "$msg" >>"${FAST_MERGE_LOG}" 2>/dev/null || true
+    printf '%s\n' "$1" >> "${FAST_MERGE_LOG}" 2>/dev/null || true
   fi
 }
 
-_FAST_HB_PID=
-_fast_search_progress_start() {
-  [[ "${FAST_MERGE_PROGRESS_SEC:-15}" == "0" ]] && return 0
+_HB_PID=
+_hb_start() {
   local every="${FAST_MERGE_PROGRESS_SEC:-15}"
+  [[ "$every" == "0" ]] && return 0
   (
     local n=0
     while sleep "$every"; do
       n=$((n + 1))
-      echo "[progress $(date '+%H:%M:%S')] still waiting for gh search prs … (${n}×${every}s elapsed)" >&2
+      printf '[progress %s] still waiting for gh search prs ... (%dx%ss elapsed)\n' \
+        "$(date '+%H:%M:%S')" "$n" "$every" >&2
     done
   ) &
-  _FAST_HB_PID=$!
+  _HB_PID=$!
 }
 
-_fast_search_progress_stop() {
-  [[ -z "${_FAST_HB_PID:-}" ]] && return 0
-  kill "$_FAST_HB_PID" 2>/dev/null || true
-  wait "$_FAST_HB_PID" 2>/dev/null || true
-  _FAST_HB_PID=
+_hb_stop() {
+  [[ -z "${_HB_PID:-}" ]] && return 0
+  kill "$_HB_PID" 2>/dev/null || true
+  wait "$_HB_PID" 2>/dev/null || true
+  _HB_PID=
 }
 
-run_with_timeout_sec() {
-  local max_wait="${1:-0}"
-  shift
-  if [[ -z "$max_wait" || "$max_wait" == "0" ]]; then
-    "$@"
-    return $?
-  fi
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$max_wait" "$@"
-    return $?
-  fi
-  if command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$max_wait" "$@"
-    return $?
-  fi
-  "$@" &
-  local pid=$!
-  (
-    sleep "$max_wait"
-    kill -TERM "$pid" 2>/dev/null || true
-    sleep 3
-    kill -KILL "$pid" 2>/dev/null || true
-  ) &
-  local killer=$!
-  wait "$pid"
-  local ec=$?
-  kill "$killer" 2>/dev/null || true
-  wait "$killer" 2>/dev/null || true
-  if [[ "$ec" -eq 143 ]] || [[ "$ec" -eq 137 ]]; then
-    echo "error: gh search timed out after ${max_wait}s (GH_SEARCH_TIMEOUT_SEC)." >&2
+_run_timeout() {
+  local max="$1"; shift
+  [[ -z "$max" || "$max" == "0" ]] && { "$@"; return $?; }
+  command -v timeout  >/dev/null 2>&1 && { timeout  "$max" "$@"; return $?; }
+  command -v gtimeout >/dev/null 2>&1 && { gtimeout "$max" "$@"; return $?; }
+  # macOS fallback — bash background + kill watchdog
+  "$@" & local pid=$!
+  ( sleep "$max"; kill -TERM "$pid" 2>/dev/null; sleep 3; kill -KILL "$pid" 2>/dev/null ) &
+  local kpid=$!
+  wait "$pid"; local ec=$?
+  kill "$kpid" 2>/dev/null; wait "$kpid" 2>/dev/null || true
+  if [[ "$ec" -eq 143 || "$ec" -eq 137 ]]; then
+    printf 'error: gh search timed out after %ss\n' "$max" >&2
     return 124
   fi
   return "$ec"
 }
 
-normalize_gh_search_json() {
+_normalize_json() {
   local raw="$1"
-  [[ -z "${raw//[$'\t\r\n ']/}" ]] && {
-    echo '[]'
+  [[ -z "${raw//[$'\t\r\n ']/}" ]] && { printf '[]'; return 0; }
+  printf '%s' "$raw" | jq -c 'if type == "array" then . else [] end' 2>/dev/null || printf '[]'
+}
+
+# ── per-PR worker (runs as a background job) ──────────────────────────────────
+# Writes one result line to out_file; never writes to stdout/stderr (avoids
+# interleaving when multiple workers run at once).
+#
+# Args: repo_full num title url out_file method admin del_branch dry
+_worker() {
+  local repo_full="$1"
+  local num="$2"
+  local title="$3"
+  local url="$4"
+  local out_file="$5"
+  local method="$6"
+  local admin="$7"
+  local del_branch="$8"
+  local dry="$9"
+
+  local ts
+  ts="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+
+  # Single API call — access check + mergeability in one shot
+  local pr_json
+  if ! pr_json=$(gh pr view "$num" --repo "$repo_full" --json mergeable 2>/dev/null); then
+    printf '[SKIP]   %s %s#%s  reason=no_access  %s\n' \
+      "$ts" "$repo_full" "$num" "$title" >> "$out_file"
     return 0
-  }
-  echo "$raw" | jq -c 'if type == "array" then . else [] end' 2>/dev/null || echo '[]'
-}
-
-usage() {
-  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
-}
-
-command -v jq >/dev/null 2>&1 || {
-  echo "error: jq is required (brew install jq)" >&2
-  exit 1
-}
-
-MY_LOGIN=$(gh api user -q .login 2>/dev/null) || {
-  echo "error: gh api user failed; run: gh auth login" >&2
-  exit 1
-}
-
-if [[ -n "${FAST_MERGE_LOG:-}" ]]; then
-  if [[ -d "${FAST_MERGE_LOG}" ]]; then
-    echo "error: FAST_MERGE_LOG is a directory, must be a file path: ${FAST_MERGE_LOG}" >&2
-    exit 1
-  fi
-  # Touch parent dir check optional; append failure is non-fatal in log_line
-  if ! ( : >>"${FAST_MERGE_LOG}" ) 2>/dev/null; then
-    echo "warning: cannot write FAST_MERGE_LOG (will continue without file log): ${FAST_MERGE_LOG}" >&2
-    FAST_MERGE_LOG=""
-  fi
-fi
-
-limit="${PR_LIMIT:-500}"
-dry="${DRY_RUN:-0}"
-method="${MERGE_METHOD:-merge}"
-admin_flag=()
-[[ "${MERGE_ADMIN:-1}" == "1" ]] && admin_flag+=(--admin)
-DELETE_FLAG=()
-[[ "${DELETE_BRANCH:-0}" == "1" ]] && DELETE_FLAG+=(--delete-branch)
-# 預設 120s 避免 gh search 無限卡住；若要不限時請設 GH_SEARCH_TIMEOUT_SEC=0
-tout="${GH_SEARCH_TIMEOUT_SEC:-120}"
-
-log_line "==> fast-merge-mergeable-prs: login=${MY_LOGIN} PR_LIMIT=${limit} MERGE_METHOD=${method} MERGE_ADMIN=${MERGE_ADMIN:-1} DRY_RUN=${dry} GH_SEARCH_TIMEOUT_SEC=${tout}"
-
-log_line "==> Searching open PRs (author=${MY_LOGIN}, non-draft) …"
-log_line "    Next line appears after GitHub returns (often 30s-several min). Heartbeat every ${FAST_MERGE_PROGRESS_SEC:-15}s; FAST_MERGE_PROGRESS_SEC=0 disables."
-_fast_search_progress_start
-set +e
-raw=$(run_with_timeout_sec "$tout" gh search prs --author "$MY_LOGIN" --state open --draft=false \
-  --json number,title,url,repository --limit "$limit" 2>/dev/null)
-search_ec=$?
-set -e
-_fast_search_progress_stop
-
-if [[ "$search_ec" -eq 124 ]]; then
-  echo "error: search timed out; increase GH_SEARCH_TIMEOUT_SEC or check network." >&2
-  exit 124
-fi
-
-json=$(normalize_gh_search_json "$raw")
-count=$(echo "$json" | jq 'length')
-log_line "==> Search done: ${count} PR(s) (dedupe by URL below)"
-
-merged_n=0
-skipped_n=0
-err_n=0
-
-while read -r row; do
-  title=$(echo "$row" | jq -r '.title')
-  url=$(echo "$row" | jq -r '.url')
-  num=$(echo "$row" | jq -r '.number')
-  repo_full=$(echo "$row" | jq -r '.repository.nameWithOwner // empty')
-  [[ -z "$repo_full" || "$repo_full" == "null" ]] && continue
-
-  ts="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-
-  if ! gh pr view "$num" --repo "$repo_full" --json mergeable &>/dev/null; then
-    log_line "[SKIP] ${ts} ${repo_full}#${num} reason=no_access_or_not_visible title=${title}"
-    skipped_n=$((skipped_n + 1))
-    continue
   fi
 
-  mergeable=$(gh pr view "$num" --repo "$repo_full" --json mergeable -q .mergeable)
+  local mergeable
+  mergeable=$(printf '%s' "$pr_json" | jq -r '.mergeable // "UNKNOWN"')
 
   if [[ "$mergeable" != "MERGEABLE" ]]; then
-    log_line "[SKIP] ${ts} ${repo_full}#${num} mergeable=${mergeable} title=${title}"
-    skipped_n=$((skipped_n + 1))
-    continue
+    printf '[SKIP]   %s %s#%s  mergeable=%s  %s\n' \
+      "$ts" "$repo_full" "$num" "$mergeable" "$title" >> "$out_file"
+    return 0
   fi
 
   if [[ "$dry" == "1" ]]; then
-    log_line "[DRY_RUN] ${ts} ${repo_full}#${num} would_merge method=${method} admin=${MERGE_ADMIN:-1} title=${title}"
-    continue
+    printf '[DRY_RUN] %s %s#%s  method=%s  %s\n' \
+      "$ts" "$repo_full" "$num" "$method" "$url" >> "$out_file"
+    return 0
   fi
 
-  set +e
-  gh pr merge "$num" --repo "$repo_full" --"$method" "${admin_flag[@]+"${admin_flag[@]}"}" "${DELETE_FLAG[@]+"${DELETE_FLAG[@]}"}"
-  mec=$?
-  set -e
+  # Build gh pr merge command — avoid eval, enumerate flag combinations
+  local mec=0
+  if [[ "$admin" == "1" && "$del_branch" == "1" ]]; then
+    gh pr merge "$num" --repo "$repo_full" "--${method}" --admin --delete-branch \
+      >/dev/null 2>&1 || mec=$?
+  elif [[ "$admin" == "1" ]]; then
+    gh pr merge "$num" --repo "$repo_full" "--${method}" --admin \
+      >/dev/null 2>&1 || mec=$?
+  elif [[ "$del_branch" == "1" ]]; then
+    gh pr merge "$num" --repo "$repo_full" "--${method}" --delete-branch \
+      >/dev/null 2>&1 || mec=$?
+  else
+    gh pr merge "$num" --repo "$repo_full" "--${method}" \
+      >/dev/null 2>&1 || mec=$?
+  fi
 
   if [[ "$mec" -eq 0 ]]; then
-    log_line "[MERGED] ${ts} ${repo_full}#${num} url=${url}"
-    merged_n=$((merged_n + 1))
+    printf '[MERGED] %s %s#%s  %s\n' "$ts" "$repo_full" "$num" "$url" >> "$out_file"
   else
-    log_line "[ERROR] ${ts} ${repo_full}#${num} merge_exit=${mec} title=${title} (try MERGE_ADMIN=1 or fix branch protection / token scope)"
-    err_n=$((err_n + 1))
+    printf '[ERROR]  %s %s#%s  merge_exit=%s  %s\n' \
+      "$ts" "$repo_full" "$num" "$mec" "$title" >> "$out_file"
   fi
+}
 
-done < <(echo "$json" | jq 'unique_by(.url)' | jq -c '.[]')
+# ── main ──────────────────────────────────────────────────────────────────────
 
-log_line "==> Done: merged=${merged_n} skipped=${skipped_n} merge_errors=${err_n}"
+command -v gh  >/dev/null 2>&1 || { echo "error: gh required (brew install gh)" >&2; exit 1; }
+command -v jq  >/dev/null 2>&1 || { echo "error: jq required (brew install jq)" >&2; exit 1; }
+
+MY_LOGIN=$(gh api user -q .login 2>/dev/null) || {
+  echo "error: gh api user failed; run: gh auth login" >&2; exit 1
+}
+
+FM_METHOD="${MERGE_METHOD:-merge}"
+FM_ADMIN="${MERGE_ADMIN:-1}"
+FM_DEL="${DELETE_BRANCH:-0}"
+FM_DRY="${DRY_RUN:-0}"
+FM_PAR="${PARALLEL:-6}"
+FM_LIMIT="${PR_LIMIT:-500}"
+FM_TOUT="${GH_SEARCH_TIMEOUT_SEC:-120}"
+
+if [[ -n "${FAST_MERGE_LOG:-}" ]]; then
+  if [[ -d "${FAST_MERGE_LOG}" ]]; then
+    echo "error: FAST_MERGE_LOG must be a file path, not a directory" >&2; exit 1
+  fi
+  printf '' >> "${FAST_MERGE_LOG}" 2>/dev/null \
+    || { echo "warning: cannot write FAST_MERGE_LOG, disabling file log" >&2; FAST_MERGE_LOG=""; }
+fi
+
+log_line "==> fast-merge-mergeable-prs"
+log_line "    login=${MY_LOGIN} method=${FM_METHOD} admin=${FM_ADMIN} del_branch=${FM_DEL} dry=${FM_DRY} parallel=${FM_PAR} limit=${FM_LIMIT} timeout=${FM_TOUT}s"
+
+# ── Phase 1: search (single, sequential — GitHub API constraint) ──────────────
+
+log_line "==> Searching open PRs (author=${MY_LOGIN}, non-draft) ..."
+log_line "    Heartbeat every ${FAST_MERGE_PROGRESS_SEC:-15}s (FAST_MERGE_PROGRESS_SEC=0 to disable)"
+
+_hb_start
+set +e
+_RAW=$(_run_timeout "$FM_TOUT" gh search prs \
+  --author "$MY_LOGIN" --state open --draft=false \
+  --json number,title,url,repository --limit "$FM_LIMIT" 2>/dev/null)
+_SRCH_EC=$?
+set -e
+_hb_stop
+
+if [[ "$_SRCH_EC" -eq 124 ]]; then
+  echo "error: search timed out after ${FM_TOUT}s. Raise GH_SEARCH_TIMEOUT_SEC." >&2
+  exit 124
+fi
+
+_JSON=$(_normalize_json "$_RAW")
+_DEDUPED=$(printf '%s' "$_JSON" | jq 'unique_by(.url)')
+_COUNT=$(printf '%s' "$_DEDUPED" | jq 'length')
+log_line "==> Search done: ${_COUNT} unique PR(s) to evaluate"
+
+[[ "$_COUNT" -eq 0 ]] && { log_line "==> Nothing to do."; exit 0; }
+
+# ── Phase 2: parallel check + merge ──────────────────────────────────────────
+
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "${TMP_DIR}"' EXIT
+
+out_files=()
+pids=()
+batch=0
+processed=0
+
+while IFS= read -r row; do
+  repo=$(printf '%s' "$row" | jq -r '.repository.nameWithOwner // empty')
+  num=$(printf '%s' "$row" | jq -r '.number')
+  title=$(printf '%s' "$row" | jq -r '.title')
+  url=$(printf '%s' "$row" | jq -r '.url')
+  [[ -z "$repo" || "$repo" == "null" || -z "$num" || "$num" == "null" ]] && continue
+
+  out="${TMP_DIR}/$(printf '%s' "${repo}_${num}" | tr '/' '_').log"
+  out_files+=("$out")
+
+  _worker "$repo" "$num" "$title" "$url" "$out" \
+    "$FM_METHOD" "$FM_ADMIN" "$FM_DEL" "$FM_DRY" &
+  pids+=($!)
+  batch=$((batch + 1))
+
+  # Flush when batch is full: wait + print progress
+  if [[ "$((batch % FM_PAR))" -eq 0 ]]; then
+    wait "${pids[@]}" 2>/dev/null || true
+    pids=()
+    processed=$((processed + batch))
+    batch=0
+    log_line "    [batch] ${processed}/${_COUNT} PR(s) processed"
+  fi
+done < <(printf '%s' "$_DEDUPED" | jq -c '.[]')
+
+# Wait for any final partial batch
+if [[ "${#pids[@]}" -gt 0 ]]; then
+  wait "${pids[@]}" 2>/dev/null || true
+  processed=$((processed + batch))
+fi
+
+# ── Phase 3: print results in order + tally ───────────────────────────────────
+
+log_line ""
+log_line "---- Results ----"
+
+n_merged=0
+n_skipped=0
+n_errors=0
+n_dry=0
+
+for f in "${out_files[@]}"; do
+  [[ -f "$f" ]] || continue
+  while IFS= read -r line; do
+    log_line "$line"
+    if [[ "$line" == \[MERGED\]* ]]; then
+      n_merged=$((n_merged + 1))
+    elif [[ "$line" == \[SKIP\]* ]]; then
+      n_skipped=$((n_skipped + 1))
+    elif [[ "$line" == \[ERROR\]* ]]; then
+      n_errors=$((n_errors + 1))
+    elif [[ "$line" == \[DRY_RUN\]* ]]; then
+      n_dry=$((n_dry + 1))
+    fi
+  done < "$f"
+done
+
+log_line ""
+log_line "==> Summary: merged=${n_merged}  skipped=${n_skipped}  errors=${n_errors}  dry_run=${n_dry}"
