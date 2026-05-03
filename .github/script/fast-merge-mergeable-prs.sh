@@ -23,8 +23,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 log_line() {
   local msg="$1"
-  echo "$msg"
-  [[ -n "${FAST_MERGE_LOG:-}" ]] && echo "$msg" >>"${FAST_MERGE_LOG}"
+  printf '%s\n' "$msg"
+  # Never exit on log append (set -e): env FAST_MERGE_LOG may point to a bad path.
+  if [[ -n "${FAST_MERGE_LOG:-}" ]]; then
+    printf '%s\n' "$msg" >>"${FAST_MERGE_LOG}" 2>/dev/null || true
+  fi
 }
 
 _FAST_HB_PID=
@@ -96,10 +99,27 @@ usage() {
   sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
 }
 
+command -v jq >/dev/null 2>&1 || {
+  echo "error: jq is required (brew install jq)" >&2
+  exit 1
+}
+
 MY_LOGIN=$(gh api user -q .login 2>/dev/null) || {
   echo "error: gh api user failed; run: gh auth login" >&2
   exit 1
 }
+
+if [[ -n "${FAST_MERGE_LOG:-}" ]]; then
+  if [[ -d "${FAST_MERGE_LOG}" ]]; then
+    echo "error: FAST_MERGE_LOG is a directory, must be a file path: ${FAST_MERGE_LOG}" >&2
+    exit 1
+  fi
+  # Touch parent dir check optional; append failure is non-fatal in log_line
+  if ! ( : >>"${FAST_MERGE_LOG}" ) 2>/dev/null; then
+    echo "warning: cannot write FAST_MERGE_LOG (will continue without file log): ${FAST_MERGE_LOG}" >&2
+    FAST_MERGE_LOG=""
+  fi
+fi
 
 limit="${PR_LIMIT:-500}"
 dry="${DRY_RUN:-0}"
@@ -114,7 +134,7 @@ tout="${GH_SEARCH_TIMEOUT_SEC:-120}"
 log_line "==> fast-merge-mergeable-prs: login=${MY_LOGIN} PR_LIMIT=${limit} MERGE_METHOD=${method} MERGE_ADMIN=${MERGE_ADMIN:-1} DRY_RUN=${dry} GH_SEARCH_TIMEOUT_SEC=${tout}"
 
 log_line "==> Searching open PRs (author=${MY_LOGIN}, non-draft) …"
-log_line "    Next line appears after GitHub returns (often 30s–several min). Heartbeat every ${FAST_MERGE_PROGRESS_SEC:-15}s; FAST_MERGE_PROGRESS_SEC=0 disables."
+log_line "    Next line appears after GitHub returns (often 30s-several min). Heartbeat every ${FAST_MERGE_PROGRESS_SEC:-15}s; FAST_MERGE_PROGRESS_SEC=0 disables."
 _fast_search_progress_start
 set +e
 raw=$(run_with_timeout_sec "$tout" gh search prs --author "$MY_LOGIN" --state open --draft=false \
