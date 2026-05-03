@@ -205,23 +205,29 @@ search_prs_for_owner_namespace() {
   local use_author=”${3:-0}”
   local raw=”” chunk=”” t0 t_end n search_ec=0
   local tout=”${GH_SEARCH_TIMEOUT_SEC:-0}”
-  local label gh_extra_args=()
+  local label author_arg=””
 
   if [[ “$use_author” == “1” ]]; then
     label=”author=${MY_LOGIN} owner=${owner_ns}”
-    gh_extra_args=(--author “$MY_LOGIN”)
+    author_arg=”$MY_LOGIN”
   else
     label=”owner=${owner_ns}”
   fi
 
   t0=$SECONDS
   echo “==> Searching PRs: ${label} (non-draft) …” >&2
-  v_log “gh search prs ${gh_extra_args[*]+”${gh_extra_args[*]}”} --owner ${owner_ns} --limit ${limit} (timeout=${tout}s)”
+  v_log “gh search prs ${author_arg:+--author $author_arg} --owner ${owner_ns} --limit ${limit} (timeout=${tout}s)”
   gh_heartbeat_start “${label}”
   set +e
-  raw=$(run_with_timeout_sec “$tout” gh search prs “${gh_extra_args[@]+”${gh_extra_args[@]}”}” \
-    --owner “$owner_ns” --state open --draft=false \
-    --json number,title,url,repository --limit “$limit” 2>/dev/null)
+  if [[ -n “$author_arg” ]]; then
+    raw=$(run_with_timeout_sec “$tout” gh search prs --author “$author_arg” \
+      --owner “$owner_ns” --state open --draft=false \
+      --json number,title,url,repository --limit “$limit” 2>/dev/null)
+  else
+    raw=$(run_with_timeout_sec “$tout” gh search prs \
+      --owner “$owner_ns” --state open --draft=false \
+      --json number,title,url,repository --limit “$limit” 2>/dev/null)
+  fi
   search_ec=$?
   set -e
   gh_heartbeat_stop
