@@ -1,38 +1,54 @@
-# Runs merge-branch.sh in SAST mode once per week to approve/merge tooling PRs
-# (Snyk, Semgrep, Husky, CodeRabbit titles) on repos you own or belong to your orgs.
+# Runs .github/script/merge-branch.sh sast-prs on a timer.
 #
-# Cross-repository merges need a Personal Access Token stored as repo secret
-# SAST_MERGE_GITHUB_TOKEN (e.g. classic PAT with "repo" + read:org, or fine-grained
-# with Pull requests and Contents on selected repositories).
-name: Weekly merge SAST PRs
+# Script behavior (see script comments): open PRs under user:<you> + each org (non-draft);
+# merge when GitHub says mergeable. Non-SAST PRs are skipped if conflicting. SAST-like
+# titles get git conflict resolution (-X ours on PR branch) then merge.
+#
+# Optional secret SAST_MERGE_GITHUB_TOKEN: PAT so gh/git can merge PRs in other repos
+# (classic "repo" + read:org, or fine-grained on those repos). Without it, Actions
+# GITHUB_TOKEN only affects *this* repository.
+#
+# Optional env overrides (uncomment / set below):
+#   MERGE_ONLY_SAST=1   — only titles matching Snyk/Semgrep/Husky/CodeRabbit
+#   DRY_RUN=1           — list actions only
+#   MERGE_ADMIN=1       — gh pr merge --admin when checks block
+name: Weekly PR merge automation
 
 on:
   workflow_dispatch:
   schedule:
-    # Every Monday 09:00 UTC; change if you prefer another day/time.
+    # Every Monday 09:00 UTC; adjust as needed.
     - cron: "0 9 * * 1"
 
 permissions:
   contents: read
 
+concurrency:
+  group: weekly-pr-merge
+  cancel-in-progress: false
+
 jobs:
-  merge_sast_prs:
-    name: Run merge-branch.sh sast-prs
+  merge_prs:
+    name: merge-branch.sh sast-prs
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Merge SAST/tooling PRs
+      - name: Run PR automation script
         env:
           PAT: ${{ secrets.SAST_MERGE_GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Optional overrides for scheduled/manual runs (edit here or use repo Variables).
+          # MERGE_ONLY_SAST: "1"
+          # DRY_RUN: "1"
         run: |
           set -euo pipefail
           if [ -n "${PAT:-}" ]; then
             export GH_TOKEN="$PAT"
           else
             export GH_TOKEN="$GITHUB_TOKEN"
-            echo "::warning title=SAST_MERGE_GITHUB_TOKEN::Repository secret not set; using default GITHUB_TOKEN. Only PRs in this repository can be merged. Add SAST_MERGE_GITHUB_TOKEN for merges across your other repos/orgs."
+            echo "::warning title=SAST_MERGE_GITHUB_TOKEN::Secret not set — using GITHUB_TOKEN. In Actions this usually only allows merges in this repository. Add SAST_MERGE_GITHUB_TOKEN to merge PRs in your other user/org repos."
           fi
           bash "${GITHUB_WORKSPACE}/.github/script/merge-branch.sh" sast-prs
