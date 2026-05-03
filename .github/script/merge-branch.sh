@@ -16,6 +16,10 @@
 #
 # Requires: gh, jq, git. Auth: gh auth login or GH_TOKEN (Actions / PAT).
 
+# 認證
+gh auth login
+
+# 設定環境
 set -euo pipefail
 
 # stderr-only; does not affect stdout JSON capture.
