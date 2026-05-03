@@ -18,6 +18,19 @@
 
 set -euo pipefail
 
+# Repo-relative script directory (logs land here by default).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Tee stdout+stderr to a file under SCRIPT_DIR. Honors MERGE_LOG_FILE; set
+# MERGE_LOG_DISABLE=1 to keep console-only output.
+merge_branch_start_session_log() {
+  local default_name="$1"
+  [[ "${MERGE_LOG_DISABLE:-0}" == "1" ]] && return 0
+  local log_path="${MERGE_LOG_FILE:-${SCRIPT_DIR}/${default_name}}"
+  exec > >(tee -a "${log_path}") 2>&1
+  echo "==> Session log: ${log_path}"
+}
+
 # stderr-only; does not affect stdout JSON capture.
 v_log() {
   [[ "${MERGE_SCRIPT_VERBOSE:-0}" == "1" ]] || return 0
@@ -60,10 +73,12 @@ Environment (PR mode):
   MERGE_METHOD=merge  merge | squash | rebase (default: merge)
   MERGE_ADMIN=1       gh pr merge --admin when checks block merge
   DELETE_BRANCH=1     gh pr merge --delete-branch
-  PR_LIMIT=100        Per search query cap (default 100)
+  PR_LIMIT=300        Per search query cap (default 300)
   MERGE_ONLY_SAST=1   Only process PRs whose title matches SAST keywords (legacy)
   VERBOSE=2 / 100 / yes  All enable verbose (not only VERBOSE=1)
   GH_HEARTBEAT_SEC=3  Seconds between "still waiting for GitHub" lines (default 3)
+  MERGE_LOG_FILE=path   Write full session log to this file (default: .github/script/merge-branch-*.log)
+  MERGE_LOG_DISABLE=1   Do not write a session log file (console only)
 
 Note: You must pass "sast-prs" for GitHub PR mode. Running the script with no args
       does nothing useful. Do not copy "git push origin $branch2" into your shell
@@ -111,7 +126,7 @@ normalize_gh_search_json() {
 }
 
 collect_open_prs_in_namespaces() {
-  local limit="${1:-100}"
+  local limit="${1:-300}"
   local combined='[]'
   local raw chunk
   local t0 t1 n
@@ -228,7 +243,7 @@ merge_all_pull_requests() {
 
   load_allowed_owners
 
-  local limit="${PR_LIMIT:-100}"
+  local limit="${PR_LIMIT:-300}"
   local dry="${DRY_RUN:-0}"
   local method="${MERGE_METHOD:-merge}"
   local only_sast="${MERGE_ONLY_SAST:-0}"
@@ -359,6 +374,7 @@ if [[ "${1:-}" == "sast-prs" ]] || [[ "${MERGE_SAST_PRS:-}" == "1" ]]; then
   fi
   export MERGE_SCRIPT_VERBOSE
   export GH_HEARTBEAT_SEC="${GH_HEARTBEAT_SEC:-3}"
+  merge_branch_start_session_log "merge-branch-$(date '+%Y%m%d-%H%M%S').log"
   merge_all_pull_requests
   exit 0
 fi
@@ -375,6 +391,7 @@ if [[ -z "${branch1:-}" || -z "${branch2:-}" ]]; then
 fi
 
 # --- CI branch merge (original behavior) ---
+merge_branch_start_session_log "merge-branch-ci-$(date '+%Y%m%d-%H%M%S').log"
 git config user.name github-actions[bot]
 git config user.email github-actions[bot]@users.noreply.github.com
 
