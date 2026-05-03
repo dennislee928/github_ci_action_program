@@ -46,6 +46,7 @@ jobs:
           # MERGE_ONLY_SAST: "1"
           # DRY_RUN: "1"
           # GH_SEARCH_TIMEOUT_SEC: "120"
+          # MERGE_SEARCH_PROGRESS_SEC: "15"   # non-verbose heartbeat during gh search; "0" = off
           # MERGE_SEARCH_BY_AUTHOR: "1"
         run: |
           set -euo pipefail
