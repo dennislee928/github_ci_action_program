@@ -7,9 +7,10 @@
 # 2) PR automation (from repo root):
 #      .github/script/merge-branch.sh sast-prs
 #
-# PR mode collects open PRs under your user namespace and your orgs (search:
-# user:LOGIN + org:ORG...), de-duplicates, then for each PR tries merge when you
-# have rights. Non-SAST PRs: merge only when GitHub reports no conflicts.
+# PR mode: Phase 1 — open PRs under your user (owner=LOGIN), then Phase 2 — each org
+# (owner=ORG). Optional MERGE_SEARCH_BY_AUTHOR=1 scopes searches with --author LOGIN
+# (same idea as web “author:”). De-duplicates per phase, then merges when allowed.
+# Non-SAST PRs: merge only when GitHub reports no conflicts.
 # SAST titles (Snyk/Semgrep/Husky/CodeRabbit): if mergeable, merge; if conflicting,
 # merges base into the PR branch locally with strategy "ours" (keep PR / tool side),
 # pushes, then merges on GitHub.
@@ -59,6 +60,41 @@ gh_heartbeat_stop() {
   _GH_HB_PID=
 }
 
+# Optional wall-clock cap for `gh search prs` (unset or 0 = no limit). Uses `timeout`,
+# `gtimeout`, or a bash fallback when GNU coreutils are missing (common on macOS).
+run_with_timeout_sec() {
+  local max_wait="${1:-0}"
+  shift
+  if [[ -z "$max_wait" || "$max_wait" == "0" ]]; then
+    "$@"
+    return $?
+  fi
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$max_wait" "$@"
+    return $?
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$max_wait" "$@"
+    return $?
+  fi
+  "$@" &
+  local pid=$!
+  (
+    sleep "$max_wait"
+    kill -TERM "$pid" 2>/dev/null || true
+  ) &
+  local killer=$!
+  wait "$pid"
+  local ec=$?
+  kill "$killer" 2>/dev/null || true
+  wait "$killer" 2>/dev/null || true
+  if [[ "$ec" -eq 143 ]] || [[ "$ec" -eq 137 ]]; then
+    echo "error: command timed out after ${max_wait}s (GH_SEARCH_TIMEOUT_SEC)." >&2
+    return 124
+  fi
+  return "$ec"
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -77,6 +113,8 @@ Environment (PR mode):
   MERGE_ONLY_SAST=1   Only process PRs whose title matches SAST keywords (legacy)
   VERBOSE=2 / 100 / yes  All enable verbose (not only VERBOSE=1)
   GH_HEARTBEAT_SEC=3  Seconds between "still waiting for GitHub" lines (default 3)
+  GH_SEARCH_TIMEOUT_SEC   Seconds; caps each gh search prs call (0/unset = no cap). Ex: 120
+  MERGE_SEARCH_BY_AUTHOR=1  Add --author LOGIN to each search (your PRs only), still scoped per owner phase
   MERGE_LOG_FILE=path   Write full session log to this file (default: .github/script/merge-branch-*.log)
   MERGE_LOG_DISABLE=1   Do not write a session log file (console only)
 
@@ -125,49 +163,150 @@ normalize_gh_search_json() {
   echo "$raw" | jq -c 'if type == "array" then . else [] end' 2>/dev/null || echo '[]'
 }
 
-collect_open_prs_in_namespaces() {
-  local limit="${1:-300}"
-  local combined='[]'
-  local raw chunk
-  local t0 t1 n
+# One `gh search prs` for a single repo owner namespace. When use_author=1, restricts to
+# PRs authored by MY_LOGIN (--author + --owner), matching the web “author:” experience.
+# Prints JSON array on stdout; progress on stderr.
+search_prs_for_owner_namespace() {
+  local owner_ns="$1"
+  local limit="${2:-300}"
+  local use_author="${3:-0}"
+  local raw="" t0 t1 n search_ec=0
+  local tout="${GH_SEARCH_TIMEOUT_SEC:-0}"
 
-  # Use gh structured flags (--owner, --draft=false). Free-text queries like
-  # user:LOGIN / -draft:true often return [] even when the web UI lists PRs.
-  # Progress must go to stderr — stdout is only the final JSON array for json=$(...) capture.
-  echo "==> Searching open PRs: owner=${MY_LOGIN} (non-draft) ..." >&2
-  echo "    Note: each gh search blocks until the API returns (no new lines). Many open PRs → 30s–2m is normal." >&2
-  v_log "gh search prs --owner ${MY_LOGIN} --limit ${limit} (calling GitHub API…)"
-  t0=$SECONDS
-  gh_heartbeat_start "owner ${MY_LOGIN}"
-  raw=$(gh search prs --owner "$MY_LOGIN" --state open --draft=false \
-    --json number,title,url,repository --limit "$limit" 2>/dev/null) || raw=''
-  gh_heartbeat_stop
-  t1=$SECONDS
-  chunk=$(normalize_gh_search_json "$raw")
-  n=$(echo "$chunk" | jq 'length')
-  v_log "owner=${MY_LOGIN} done in $((t1 - t0))s — PRs in this page: ${n}"
-  combined=$(jq -n --argjson a "$combined" --argjson b "$chunk" '$a + $b')
-
-  local org
-  for org in "${MY_ORGS[@]}"; do
-    echo "==> Searching open PRs: owner=${org} (non-draft) ..." >&2
-    v_log "gh search prs --owner ${org} --limit ${limit} (calling GitHub API…)"
+  if [[ "$use_author" == "1" ]]; then
+    echo "==> Searching PRs: author=${MY_LOGIN} owner=${owner_ns} (non-draft) ..." >&2
+    v_log "gh search prs --author ${MY_LOGIN} --owner ${owner_ns} --limit ${limit} (timeout=${tout}s)"
     t0=$SECONDS
-    gh_heartbeat_start "owner ${org}"
-    raw=$(gh search prs --owner "$org" --state open --draft=false \
-      --json number,title,url,repository --limit "$limit" 2>/dev/null) || raw=''
+    gh_heartbeat_start "author ${MY_LOGIN} owner ${owner_ns}"
+    set +e
+    raw=$(run_with_timeout_sec "$tout" gh search prs --author "$MY_LOGIN" --owner "$owner_ns" --state open --draft=false \
+      --json number,title,url,repository --limit "$limit" 2>/dev/null)
+    search_ec=$?
+    set -e
     gh_heartbeat_stop
     t1=$SECONDS
-    chunk=$(normalize_gh_search_json "$raw")
-    n=$(echo "$chunk" | jq 'length')
-    v_log "owner=${org} done in $((t1 - t0))s — PRs in this page: ${n}"
-    combined=$(jq -n --argjson a "$combined" --argjson b "$chunk" '$a + $b')
-  done
+    n=$(normalize_gh_search_json "$raw" | jq 'length')
+    v_log "author+owner=${owner_ns} done in $((t1 - t0))s — PRs: ${n} exit=${search_ec}"
+  else
+    echo "==> Searching open PRs: owner=${owner_ns} (non-draft) ..." >&2
+    v_log "gh search prs --owner ${owner_ns} --limit ${limit} (timeout=${tout}s)"
+    t0=$SECONDS
+    gh_heartbeat_start "owner ${owner_ns}"
+    set +e
+    raw=$(run_with_timeout_sec "$tout" gh search prs --owner "$owner_ns" --state open --draft=false \
+      --json number,title,url,repository --limit "$limit" 2>/dev/null)
+    search_ec=$?
+    set -e
+    gh_heartbeat_stop
+    t1=$SECONDS
+    n=$(normalize_gh_search_json "$raw" | jq 'length')
+    v_log "owner=${owner_ns} done in $((t1 - t0))s — PRs: ${n} exit=${search_ec}"
+  fi
 
-  n=$(echo "$combined" | jq 'length')
-  v_log "before unique_by(.url): merged_rows=${n}"
-  v_log "running jq unique_by(.url)…"
-  echo "$combined" | jq 'unique_by(.url)'
+  if [[ "$search_ec" -eq 124 ]]; then
+    echo "error: gh search timed out for namespace ${owner_ns} (GH_SEARCH_TIMEOUT_SEC=${tout})." >&2
+    echo '[]'
+    return 0
+  fi
+  normalize_gh_search_json "$raw" | jq 'unique_by(.url)'
+}
+
+merge_pull_requests_from_json() {
+  local json="$1"
+  local phase_label="$2"
+  local dry="$3"
+  local method="$4"
+  local only_sast="$5"
+
+  local count
+  count=$(echo "$json" | jq 'length')
+  echo "==> ${phase_label} — ${count} PR(s) to evaluate" >&2
+  v_log "streaming ${count} PR rows; json bytes=${#json}"
+
+  local _row_i=0
+  while read -r row; do
+    _row_i=$((_row_i + 1))
+    v_log "row ${_row_i}/${count}"
+    local title url repo_full owner num mergeable sast
+    title=$(echo "$row" | jq -r '.title')
+    url=$(echo "$row" | jq -r '.url')
+    num=$(echo "$row" | jq -r '.number')
+    repo_full=$(echo "$row" | jq -r '.repository.nameWithOwner // empty')
+    [[ -z "$repo_full" || "$repo_full" == "null" ]] && continue
+    owner="${repo_full%%/*}"
+
+    if ! repo_owner_allowed "$owner"; then
+      echo "skip (repo outside your user/orgs): $repo_full#$num"
+      continue
+    fi
+
+    sast=false
+    is_sast_pr_title "$title" && sast=true
+
+    if [[ "$only_sast" == "1" ]] && [[ "$sast" != true ]]; then
+      echo "skip (MERGE_ONLY_SAST): ${repo_full}#$num — $title"
+      continue
+    fi
+
+    echo ""
+    echo "---- ${repo_full}#${num} ----"
+    echo "title: $title"
+    echo "url:   $url"
+    echo "sast:  $sast"
+
+    if [[ "$dry" == "1" ]]; then
+      echo "[DRY_RUN] would inspect merge state and merge or resolve SAST conflicts"
+      continue
+    fi
+
+    if ! gh pr view "$num" --repo "$repo_full" --json mergeable &>/dev/null; then
+      echo "skip: cannot view PR (no access?)"
+      continue
+    fi
+
+    mergeable=$(gh pr view "$num" --repo "$repo_full" --json mergeable -q .mergeable)
+    v_log "PR ${repo_full}#${num} mergeable=${mergeable}"
+
+    if [[ "$mergeable" == "UNKNOWN" ]]; then
+      echo "skip: mergeability unknown (wait and retry)"
+      continue
+    fi
+
+    if [[ "$mergeable" == "CONFLICTING" ]]; then
+      if [[ "$sast" == true ]]; then
+        echo "SAST PR has conflicts: resolving by merging base into PR branch (-X ours) ..."
+        if resolve_sast_conflicts_via_git "$repo_full" "$num"; then
+          sleep 4
+          mergeable=$(gh pr view "$num" --repo "$repo_full" --json mergeable -q .mergeable)
+          echo "mergeable after fix: $mergeable"
+        else
+          echo "skip: could not auto-resolve conflicts"
+          continue
+        fi
+      else
+        echo "skip: conflicts on non-SAST PR (resolve manually)"
+        continue
+      fi
+    fi
+
+    if [[ "$mergeable" != "MERGEABLE" ]]; then
+      echo "skip: mergeable=$mergeable"
+      continue
+    fi
+
+    set +e
+    set +u
+    try_approve_and_merge "$repo_full" "$num" "$method" "${admin_flag[@]+"${admin_flag[@]}"}"
+    merge_ec=$?
+    set -u
+    set -e
+    if [[ "$merge_ec" -eq 0 ]]; then
+      echo "merged OK"
+    else
+      echo "skip/error: merge failed or script error on ${repo_full}#${num} (exit ${merge_ec}). Try MERGE_ADMIN=1 or fix CI." >&2
+      v_log "merge attempt exit=${merge_ec} repo=${repo_full} num=${num}"
+    fi
+  done < <(echo "$json" | jq -c '.[]')
 }
 
 # On PR head branch: merge origin/base with -X ours so conflict hunks keep the PR (tool) side.
@@ -256,105 +395,26 @@ merge_all_pull_requests() {
 
   echo "==> Logged in as: $MY_LOGIN"
   echo "==> Orgs (${#MY_ORGS[@]}): ${MY_ORGS[*]:-(none)}"
-  v_log "PR_LIMIT=${limit} DRY_RUN=${dry} MERGE_ONLY_SAST=${only_sast} MERGE_ADMIN=${MERGE_ADMIN:-0}"
+  v_log "PR_LIMIT=${limit} DRY_RUN=${dry} MERGE_ONLY_SAST=${only_sast} MERGE_ADMIN=${MERGE_ADMIN:-0} MERGE_SEARCH_BY_AUTHOR=${MERGE_SEARCH_BY_AUTHOR:-0} GH_SEARCH_TIMEOUT_SEC=${GH_SEARCH_TIMEOUT_SEC:-0}"
+
+  local use_author=0
+  [[ "${MERGE_SEARCH_BY_AUTHOR:-0}" == "1" ]] && use_author=1
+
+  echo "    Note: each \`gh search\` blocks until the API returns. Many open PRs → 30s–2m is normal." >&2
+  echo "==> Order: Phase 1 = your user namespace (${MY_LOGIN}/*), then Phase 2 = each org; one PR at a time." >&2
 
   local json
-  json=$(collect_open_prs_in_namespaces "$limit")
+  local org
 
-  local count
-  count=$(echo "$json" | jq 'length')
-  echo "==> Unique open PRs (user + org searches): $count"
-  v_log "json bytes=${#json} (stdout from collect must be JSON only)"
-  echo "==> Merging / skipping (sequential, one PR at a time) …" >&2
-  v_log "streaming ${count} PR records from jq; row numbers = position in this list"
+  echo "==> Phase 1: searching & merging personal namespace (owner=${MY_LOGIN}) …" >&2
+  json=$(search_prs_for_owner_namespace "$MY_LOGIN" "$limit" "$use_author")
+  merge_pull_requests_from_json "$json" "Phase 1 — personal repos" "$dry" "$method" "$only_sast"
 
-  # Process substitution keeps this loop in the same shell as merge_all_pull_requests.
-  # A pipe to `while` would fork a subshell where local admin_flag is unset (set -u error).
-  local _row_i=0
-  while read -r row; do
-    _row_i=$((_row_i + 1))
-    v_log "row ${_row_i}/${count} (from search JSON stream)"
-    local title url repo_full owner num mergeable sast
-    title=$(echo "$row" | jq -r '.title')
-    url=$(echo "$row" | jq -r '.url')
-    num=$(echo "$row" | jq -r '.number')
-    repo_full=$(echo "$row" | jq -r '.repository.nameWithOwner // empty')
-    [[ -z "$repo_full" || "$repo_full" == "null" ]] && continue
-    owner="${repo_full%%/*}"
-
-    if ! repo_owner_allowed "$owner"; then
-      echo "skip (repo outside your user/orgs): $repo_full#$num"
-      continue
-    fi
-
-    sast=false
-    is_sast_pr_title "$title" && sast=true
-
-    if [[ "$only_sast" == "1" ]] && [[ "$sast" != true ]]; then
-      echo "skip (MERGE_ONLY_SAST): ${repo_full}#$num — $title"
-      continue
-    fi
-
-    echo ""
-    echo "---- ${repo_full}#${num} ----"
-    echo "title: $title"
-    echo "url:   $url"
-    echo "sast:  $sast"
-
-    if [[ "$dry" == "1" ]]; then
-      echo "[DRY_RUN] would inspect merge state and merge or resolve SAST conflicts"
-      continue
-    fi
-
-    if ! gh pr view "$num" --repo "$repo_full" --json mergeable &>/dev/null; then
-      echo "skip: cannot view PR (no access?)"
-      continue
-    fi
-
-    mergeable=$(gh pr view "$num" --repo "$repo_full" --json mergeable -q .mergeable)
-    v_log "PR ${repo_full}#${num} mergeable=${mergeable}"
-
-    if [[ "$mergeable" == "UNKNOWN" ]]; then
-      echo "skip: mergeability unknown (wait and retry)"
-      continue
-    fi
-
-    if [[ "$mergeable" == "CONFLICTING" ]]; then
-      if [[ "$sast" == true ]]; then
-        echo "SAST PR has conflicts: resolving by merging base into PR branch (-X ours) ..."
-        if resolve_sast_conflicts_via_git "$repo_full" "$num"; then
-          sleep 4
-          mergeable=$(gh pr view "$num" --repo "$repo_full" --json mergeable -q .mergeable)
-          echo "mergeable after fix: $mergeable"
-        else
-          echo "skip: could not auto-resolve conflicts"
-          continue
-        fi
-      else
-        echo "skip: conflicts on non-SAST PR (resolve manually)"
-        continue
-      fi
-    fi
-
-    if [[ "$mergeable" != "MERGEABLE" ]]; then
-      echo "skip: mergeable=$mergeable"
-      continue
-    fi
-
-    # Survive gh/jq/bash faults: log and continue (do not abort whole run).
-    set +e
-    set +u
-    try_approve_and_merge "$repo_full" "$num" "$method" "${admin_flag[@]+"${admin_flag[@]}"}"
-    merge_ec=$?
-    set -u
-    set -e
-    if [[ "$merge_ec" -eq 0 ]]; then
-      echo "merged OK"
-    else
-      echo "skip/error: merge failed or script error on ${repo_full}#${num} (exit ${merge_ec}). Try MERGE_ADMIN=1 or fix CI." >&2
-      v_log "merge attempt exit=${merge_ec} repo=${repo_full} num=${num}"
-    fi
-  done < <(echo "$json" | jq -c '.[]')
+  for org in "${MY_ORGS[@]}"; do
+    echo "==> Phase 2: searching & merging org namespace (owner=${org}) …" >&2
+    json=$(search_prs_for_owner_namespace "$org" "$limit" "$use_author")
+    merge_pull_requests_from_json "$json" "Phase 2 — org ${org}" "$dry" "$method" "$only_sast"
+  done
 
   echo ""
   echo "Done."
