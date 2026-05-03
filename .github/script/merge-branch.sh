@@ -209,7 +209,7 @@ try_approve_and_merge() {
   local -a extra_flags=("$@")
 
   gh pr review "$num" --repo "$repo_full" --approve --body "Approved: automated merge." 2>/dev/null || true
-  gh pr merge "$num" --repo "$repo_full" --"$method" "${extra_flags[@]}" "${DELETE_FLAG_ARR[@]}"
+  gh pr merge "$num" --repo "$repo_full" --"$method" "${extra_flags[@]}" "${DELETE_FLAG_ARR[@]+"${DELETE_FLAG_ARR[@]}"}"
 }
 
 merge_all_pull_requests() {
@@ -232,8 +232,9 @@ merge_all_pull_requests() {
   local dry="${DRY_RUN:-0}"
   local method="${MERGE_METHOD:-merge}"
   local only_sast="${MERGE_ONLY_SAST:-0}"
-  local admin_flag=()
-  # Bash 3.2 (macOS default) has no "declare -g"; plain assignment is global in a function.
+  # Do not use `local admin_flag` here: bash 3.2 + `local` inside the PR `while` loop
+  # can leave admin_flag unset when expanding "${admin_flag[@]}" under `set -u`.
+  admin_flag=()
   DELETE_FLAG_ARR=()
   [[ "${MERGE_ADMIN:-0}" == "1" ]] && admin_flag+=(--admin)
   [[ "${DELETE_BRANCH:-0}" == "1" ]] && DELETE_FLAG_ARR+=(--delete-branch)
@@ -325,10 +326,18 @@ merge_all_pull_requests() {
       continue
     fi
 
-    if try_approve_and_merge "$repo_full" "$num" "$method" "${admin_flag[@]}"; then
+    # Survive gh/jq/bash faults: log and continue (do not abort whole run).
+    set +e
+    set +u
+    try_approve_and_merge "$repo_full" "$num" "$method" "${admin_flag[@]+"${admin_flag[@]}"}"
+    merge_ec=$?
+    set -u
+    set -e
+    if [[ "$merge_ec" -eq 0 ]]; then
       echo "merged OK"
     else
-      echo "merge failed (checks, reviews, or permissions). Try MERGE_ADMIN=1 or fix CI."
+      echo "skip/error: merge failed or script error on ${repo_full}#${num} (exit ${merge_ec}). Try MERGE_ADMIN=1 or fix CI." >&2
+      v_log "merge attempt exit=${merge_ec} repo=${repo_full} num=${num}"
     fi
   done < <(echo "$json" | jq -c '.[]')
 
