@@ -41,3 +41,7 @@ Thumbs.db
 node_modules
 package.json
 package-lock.json
+
+
+*.log
+.github/script/merge-branch-*.log
