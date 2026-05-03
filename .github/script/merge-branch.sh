@@ -16,10 +16,6 @@
 #
 # Requires: gh, jq, git. Auth: gh auth login or GH_TOKEN (Actions / PAT).
 
-# 認證
-gh auth login
-
-# 設定環境
 set -euo pipefail
 
 # stderr-only; does not affect stdout JSON capture.
@@ -28,15 +24,16 @@ v_log() {
   echo "[verbose $(date '+%H:%M:%S')] $*" >&2
 }
 
-# While `raw=$(gh search prs ...)` runs, the shell prints nothing. Heartbeat every 8s in verbose mode.
+# While `raw=$(gh search prs ...)` runs, the shell prints nothing. Optional heartbeat (default 3s).
 _GH_HB_PID=
 gh_heartbeat_start() {
   [[ "${MERGE_SCRIPT_VERBOSE:-0}" == "1" ]] || return 0
+  local every="${GH_HEARTBEAT_SEC:-3}"
   (
     local n=0
-    while sleep 8; do
+    while sleep "$every"; do
       n=$((n + 1))
-      echo "[verbose $(date '+%H:%M:%S')] still waiting for GitHub: $* … (${n}×8s elapsed)" >&2
+      echo "[verbose $(date '+%H:%M:%S')] still waiting for GitHub: $* … (${n}×${every}s elapsed)" >&2
     done
   ) &
   _GH_HB_PID=$!
@@ -65,6 +62,8 @@ Environment (PR mode):
   DELETE_BRANCH=1     gh pr merge --delete-branch
   PR_LIMIT=100        Per search query cap (default 100)
   MERGE_ONLY_SAST=1   Only process PRs whose title matches SAST keywords (legacy)
+  VERBOSE=2 / 100 / yes  All enable verbose (not only VERBOSE=1)
+  GH_HEARTBEAT_SEC=3  Seconds between "still waiting for GitHub" lines (default 3)
 
 Note: You must pass "sast-prs" for GitHub PR mode. Running the script with no args
       does nothing useful. Do not copy "git push origin $branch2" into your shell
@@ -152,6 +151,7 @@ collect_open_prs_in_namespaces() {
 
   n=$(echo "$combined" | jq 'length')
   v_log "before unique_by(.url): merged_rows=${n}"
+  v_log "running jq unique_by(.url)…"
   echo "$combined" | jq 'unique_by(.url)'
 }
 
@@ -249,10 +249,15 @@ merge_all_pull_requests() {
   count=$(echo "$json" | jq 'length')
   echo "==> Unique open PRs (user + org searches): $count"
   v_log "json bytes=${#json} (stdout from collect must be JSON only)"
+  echo "==> Merging / skipping (sequential, one PR at a time) …" >&2
+  v_log "streaming ${count} PR records from jq; row numbers = position in this list"
 
   # Process substitution keeps this loop in the same shell as merge_all_pull_requests.
   # A pipe to `while` would fork a subshell where local admin_flag is unset (set -u error).
+  local _row_i=0
   while read -r row; do
+    _row_i=$((_row_i + 1))
+    v_log "row ${_row_i}/${count} (from search JSON stream)"
     local title url repo_full owner num mergeable sast
     title=$(echo "$row" | jq -r '.title')
     url=$(echo "$row" | jq -r '.url')
@@ -334,11 +339,17 @@ merge_all_pull_requests() {
 # --- Mode: PR automation ---
 if [[ "${1:-}" == "sast-prs" ]] || [[ "${MERGE_SAST_PRS:-}" == "1" ]]; then
   MERGE_SCRIPT_VERBOSE="${MERGE_SCRIPT_VERBOSE:-0}"
-  [[ "${VERBOSE:-0}" == "1" || "${MERGE_VERBOSE:-0}" == "1" ]] && MERGE_SCRIPT_VERBOSE=1
-  if [[ "${2:-}" == "-v" || "${2:-}" == "--verbose" ]]; then
-    MERGE_SCRIPT_VERBOSE=1
+  [[ "${2:-}" == "-v" || "${2:-}" == "--verbose" ]] && MERGE_SCRIPT_VERBOSE=1
+  [[ "${MERGE_VERBOSE:-0}" == "1" ]] && MERGE_SCRIPT_VERBOSE=1
+  # VERBOSE=2, 100, yes, … all turn on (only 0 / false / no / off stay off)
+  if [[ -n "${VERBOSE+x}" ]]; then
+    case "${VERBOSE}" in
+      0 | false | no | NO | off | OFF) ;;
+      *) MERGE_SCRIPT_VERBOSE=1 ;;
+    esac
   fi
   export MERGE_SCRIPT_VERBOSE
+  export GH_HEARTBEAT_SEC="${GH_HEARTBEAT_SEC:-3}"
   merge_all_pull_requests
   exit 0
 fi
