@@ -131,7 +131,7 @@ _merge_worker() {
 }
 
 # ── Phase 3 worker: retry UNKNOWN ─────────────────────────────────────────────
-# Re-checks mergeability (triggers GitHub to compute it); merges if MERGEABLE.
+# Re-checks mergeability; merges if MERGEABLE; routes CONFLICTING to Phase 4.
 # Args: repo num title url out_file method admin del_branch dry
 _retry_unknown_worker() {
   local repo_full="$1" num="$2" title="$3" url="$4" out_file="$5"
@@ -153,6 +153,18 @@ _retry_unknown_worker() {
   if [[ "$mergeable" == "MERGEABLE" ]]; then
     _merge_worker "$repo_full" "$num" "$title" "$url" "$out_file" \
       "$method" "$admin" "$del_branch" "$dry"
+  elif [[ "$mergeable" == "CONFLICTING" ]]; then
+    # Route to Phase 4 conflict resolution instead of skipping.
+    # Write a JSON object to the shared queue file (TMP_DIR is set before workers start).
+    jq -n \
+      --arg repo "$repo_full" \
+      --argjson num "$num" \
+      --arg title "$title" \
+      --arg url "$url" \
+      '{repository:{nameWithOwner:$repo},number:$num,title:$title,url:$url,mergeable:"CONFLICTING"}' \
+      >> "${TMP_DIR}/p3_conflicting.jsonl"
+    printf '[REQUEUE_P4] %s %s#%s  UNKNOWN->CONFLICTING, routing to Phase 4  %s\n' \
+      "$ts" "$repo_full" "$num" "$title" >> "$out_file"
   else
     printf '[SKIP_UNKNOWN] %s %s#%s  still=%s  %s\n' \
       "$ts" "$repo_full" "$num" "$mergeable" "$title" >> "$out_file"
@@ -243,27 +255,44 @@ _resolve_conflict_worker() {
   new_state=$(gh pr view "$num" --repo "$repo_full" \
     --json mergeable -q .mergeable 2>/dev/null) || new_state="UNKNOWN"
 
-  if [[ "$new_state" != "MERGEABLE" ]]; then
-    printf '[ERROR_CONFLICT] %s %s#%s  still=%s after conflict fix  %s\n' \
-      "$ts" "$repo_full" "$num" "$new_state" "$title" >> "$out_file"
+  # Only bail if GitHub explicitly says CONFLICTING — UNKNOWN means still computing,
+  # so we attempt the merge and let GitHub accept or reject it.
+  if [[ "$new_state" == "CONFLICTING" ]]; then
+    printf '[ERROR_CONFLICT] %s %s#%s  still=CONFLICTING after fix (real merge conflict?)  %s\n' \
+      "$ts" "$repo_full" "$num" "$title" >> "$out_file"
     return 0
   fi
 
-  local mec=0
+  local mec=0 merge_err=""
   if [[ "$admin" == "1" ]]; then
-    gh pr merge "$num" --repo "$repo_full" "--${method}" --admin \
-      >/dev/null 2>&1 || mec=$?
+    merge_err=$(gh pr merge "$num" --repo "$repo_full" "--${method}" --admin 2>&1) || mec=$?
   else
-    gh pr merge "$num" --repo "$repo_full" "--${method}" \
-      >/dev/null 2>&1 || mec=$?
+    merge_err=$(gh pr merge "$num" --repo "$repo_full" "--${method}" 2>&1) || mec=$?
   fi
 
   if [[ "$mec" -eq 0 ]]; then
     printf '[MERGED_CONFLICT] %s %s#%s  (resolved+merged)  %s\n' \
       "$ts" "$repo_full" "$num" "$url" >> "$out_file"
+    return 0
+  fi
+
+  # Single retry after a brief delay (GitHub may be mid-computation after the push)
+  sleep 5
+  local retry_mec=0 retry_err=""
+  if [[ "$admin" == "1" ]]; then
+    retry_err=$(gh pr merge "$num" --repo "$repo_full" "--${method}" --admin 2>&1) || retry_mec=$?
   else
-    printf '[ERROR_CONFLICT] %s %s#%s  merge_exit=%s  %s\n' \
-      "$ts" "$repo_full" "$num" "$mec" "$title" >> "$out_file"
+    retry_err=$(gh pr merge "$num" --repo "$repo_full" "--${method}" 2>&1) || retry_mec=$?
+  fi
+
+  if [[ "$retry_mec" -eq 0 ]]; then
+    printf '[MERGED_CONFLICT] %s %s#%s  (resolved+merged, retry)  %s\n' \
+      "$ts" "$repo_full" "$num" "$url" >> "$out_file"
+  else
+    local reason="${retry_err:-${merge_err}}"
+    reason="${reason//$'\n'/ }"
+    printf '[ERROR_CONFLICT] %s %s#%s  merge_exit=%s  %s  reason=%s\n' \
+      "$ts" "$repo_full" "$num" "$retry_mec" "$title" "$reason" >> "$out_file"
   fi
 }
 
@@ -329,6 +358,8 @@ _run_phase() {
               "$line" == \[SKIP_UNKNOWN\]* ]]; then
         n_skip=$((n_skip + 1))
         _TOTAL_SKIPPED=$((_TOTAL_SKIPPED + 1))
+      elif [[ "$line" == \[REQUEUE_P4\]* ]]; then
+        : # Counted in Phase 4 (routed from Phase 3)
       elif [[ "$line" == \[DRY_RUN\]* || "$line" == \[DRY_CONFLICT\]* ]]; then
         _TOTAL_DRY=$((_TOTAL_DRY + 1))
       fi
@@ -440,6 +471,17 @@ fi
 
 # ── Phase 4: resolve CONFLICTING SAST PRs ─────────────────────────────────────
 
+# Absorb PRs that Phase 3 discovered were CONFLICTING (were UNKNOWN at GraphQL time)
+if [[ -f "${TMP_DIR}/p3_conflicting.jsonl" ]]; then
+  p3_extra=$(jq -s '.' "${TMP_DIR}/p3_conflicting.jsonl" 2>/dev/null) || p3_extra='[]'
+  p3_extra_count=$(printf '%s' "$p3_extra" | jq 'length')
+  if [[ "$p3_extra_count" -gt 0 ]]; then
+    log_line "==> Phase 4 extra: ${p3_extra_count} PR(s) routed from Phase 3 (UNKNOWN->CONFLICTING)"
+    CONFLICTING_PRS=$(printf '%s\n%s' "$CONFLICTING_PRS" "$p3_extra" | jq -s 'add // []')
+    CC=$(printf '%s' "$CONFLICTING_PRS" | jq 'length')
+  fi
+fi
+
 log_line ""
 log_line "---- Phase 4: resolve CONFLICTING PRs (parallel=${FM_CPAR}) ----"
 if [[ "$CC" -eq 0 ]]; then
@@ -458,10 +500,12 @@ log_line "===================================================================="
 log_line "==> TOTAL SUMMARY"
 log_line "    merged=${_TOTAL_MERGED}  errors=${_TOTAL_ERRORS}  skipped=${_TOTAL_SKIPPED}  dry_run=${_TOTAL_DRY}"
 log_line ""
-log_line "  [ERROR] causes:"
-log_line "    merge_exit!=0 in owned repo — CI failing / branch protection / token missing repo scope"
-log_line "  [SKIP_EXTERNAL]  — PR in a repo not owned by you or your orgs; filtered before attempts"
-log_line "  [SKIP_CONFLICT]  — non-SAST conflicting PR: rebase your branch or run merge-branch.sh"
-log_line "  [SKIP_UNKNOWN]   — GitHub still computing mergeability: re-run in a few minutes"
-log_line "  [ERROR_CONFLICT] — SAST conflict resolution failed: check clone access / git history"
+log_line "  [ERROR]          — merge failed in owned repo: CI checks / branch protection / token scope"
+log_line "  [ERROR_CONFLICT] — SAST conflict fix succeeded but final merge failed (see reason= field)"
+log_line "                     Common: adjacent PR merged first making this one conflicting again."
+log_line "                     Fix: re-run the script; or close & let Snyk open a fresh PR."
+log_line "  [SKIP_EXTERNAL]  — repo not owned by you or your orgs; skipped without attempting"
+log_line "  [SKIP_CONFLICT]  — non-SAST conflicting PR: resolve manually or run merge-branch.sh"
+log_line "  [SKIP_UNKNOWN]   — still UNKNOWN after retry (GitHub busy): re-run in a few minutes"
+log_line "  [REQUEUE_P4]     — was UNKNOWN at fetch time, turned CONFLICTING; processed in Phase 4"
 log_line "===================================================================="

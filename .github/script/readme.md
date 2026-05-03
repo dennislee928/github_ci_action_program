@@ -12,22 +12,23 @@
 
 | Phase | 行為 |
 |-------|------|
-| **1** | GraphQL 取回所有 open non-draft PR 及 `mergeable` 狀態（通常 < 5 s）。不屬於你或你 org 的 repo → `SKIP_EXTERNAL`。 |
+| **1** | GraphQL 取回所有 open non-draft PR 及 `mergeable` 狀態（通常 < 5 s）。不屬於你或你 org 的 repo → `SKIP_EXTERNAL`（不嘗試 merge）。 |
 | **2** | `MERGEABLE` PR → 平行直接 merge（預設 `--admin`）。 |
-| **3** | `UNKNOWN` PR → Phase 2 跑完後重新確認，若 MERGEABLE 就 merge。 |
-| **4** | `CONFLICTING` SAST PR（標題含 Snyk/Semgrep/Husky/CodeRabbit）→ blobless clone + `git merge -X ours`（保留 PR 側）+ push + merge。非 SAST → `SKIP_CONFLICT`。 |
+| **3** | `UNKNOWN` PR → Phase 2 跑完後重新確認；若 MERGEABLE → merge；若 CONFLICTING → 路由到 Phase 4（`REQUEUE_P4`）；若仍 UNKNOWN → `SKIP_UNKNOWN`。 |
+| **4** | `CONFLICTING` SAST PR（標題含 Snyk/Semgrep/Husky/CodeRabbit）→ blobless clone + `git merge -X ours`（保留 PR 側）+ push；push 成功後若仍 CONFLICTING 才放棄；否則嘗試 merge（含一次 retry）。非 SAST → `SKIP_CONFLICT`。 |
 
 ### 結果標籤
 
 | 標籤 | 意義 |
 |------|------|
 | `[MERGED]` | 成功 merge |
-| `[MERGED_CONFLICT]` | 衝突自動解決並 merge |
-| `[SKIP_EXTERNAL]` | Repo 不屬於你或你的 org，跳過 |
-| `[SKIP_CONFLICT]` | 非 SAST 有衝突，需手動解決 |
+| `[MERGED_CONFLICT]` | 衝突自動解決並 merge（含 retry） |
+| `[REQUEUE_P4]` | Phase 3 時發現從 UNKNOWN 變 CONFLICTING，路由到 Phase 4 處理 |
+| `[SKIP_EXTERNAL]` | Repo 不屬於你或你的 org，跳過不嘗試 |
+| `[SKIP_CONFLICT]` | 非 SAST 有衝突，需手動解決或用 merge-branch.sh |
 | `[SKIP_UNKNOWN]` | 重試後仍 UNKNOWN，數分鐘後重跑 |
-| `[ERROR]` | 你 org/自己 repo 的 merge 失敗（CI / branch protection / token 權限不足） |
-| `[ERROR_CONFLICT]` | SAST 衝突解決失敗（clone 失敗 / git 歷史問題） |
+| `[ERROR]` | 你 repo 的 merge 失敗（CI / branch protection / token 權限不足） |
+| `[ERROR_CONFLICT]` | 衝突解決後 merge 仍失敗（詳見 `reason=` 欄位）。常見原因：同 repo 另一 PR 先合入導致此 PR 再次衝突。修法：重跑腳本，或關閉後讓 Snyk 重開。 |
 
 ### 常用環境變數
 

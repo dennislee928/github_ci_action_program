@@ -93,22 +93,23 @@ VERBOSE=1 .github/script/fast-merge-mergeable-prs.sh
 
 | Phase | What happens |
 |-------|-------------|
-| **1** | GraphQL fetch — all open non-draft PRs with `mergeable` state in one call (typically < 5 s). External repos (not owned by you or your orgs) logged as `SKIP_EXTERNAL`. |
+| **1** | GraphQL fetch — all open non-draft PRs with `mergeable` state in one call (typically < 5 s). Repos not owned by you or your orgs → `SKIP_EXTERNAL` immediately. |
 | **2** | `MERGEABLE` PRs — immediate parallel merge (`--admin` by default). |
-| **3** | `UNKNOWN` PRs — re-check after Phase 2 delay; merge if now `MERGEABLE`. |
-| **4** | `CONFLICTING` SAST PRs — blobless clone (`--filter=blob:none`), `git merge -X ours` (keep PR side), push, then merge. Non-SAST → `SKIP_CONFLICT`. |
+| **3** | `UNKNOWN` PRs — re-check after Phase 2 delay; merge if `MERGEABLE`; route to Phase 4 if now `CONFLICTING` (`REQUEUE_P4`). |
+| **4** | `CONFLICTING` SAST PRs (Snyk/Semgrep/Husky/CodeRabbit) — blobless clone (`--filter=blob:none`), `git merge -X ours` (keep PR side), push; if merge still fails after a retry, logs reason. Non-SAST → `SKIP_CONFLICT`. |
 
 **Result tags:**
 
 | Tag | Meaning |
 |-----|---------|
 | `[MERGED]` | Successfully merged |
-| `[MERGED_CONFLICT]` | Conflict auto-resolved and merged |
-| `[SKIP_EXTERNAL]` | Repo not owned by you/your orgs — skipped |
-| `[SKIP_CONFLICT]` | Non-SAST conflicting PR — fix manually |
+| `[MERGED_CONFLICT]` | Conflict auto-resolved and merged (with optional retry) |
+| `[REQUEUE_P4]` | Was UNKNOWN at fetch; turned CONFLICTING in Phase 3 → processed in Phase 4 |
+| `[SKIP_EXTERNAL]` | Repo not owned by you/your orgs — skipped without attempting |
+| `[SKIP_CONFLICT]` | Non-SAST conflicting PR — fix manually or run `merge-branch.sh` |
 | `[SKIP_UNKNOWN]` | Still UNKNOWN after retry — re-run in a few minutes |
 | `[ERROR]` | Merge failed in owned repo (CI / branch protection / token scope) |
-| `[ERROR_CONFLICT]` | SAST conflict resolution failed (clone access / git history) |
+| `[ERROR_CONFLICT]` | Post-resolution merge failed (see `reason=` in log). Common cause: an adjacent PR merged first, making this one conflicting again. Fix: re-run, or close and let Snyk reopen. |
 
 #### Key environment variables
 
