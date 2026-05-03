@@ -68,11 +68,69 @@ First, let's add a workflow to lint (clean, like a lint roller) our Markdown fil
 
 ---
 
-## PR Automation (`merge-branch.sh sast-prs`)
+## PR Automation
+
+Two scripts handle automated PR merging. Use `fast-merge-mergeable-prs.sh` for speed (GraphQL, parallel), and `merge-branch.sh` for the sequential SAST-focused sweep.
+
+### `fast-merge-mergeable-prs.sh` — 4-phase parallel merge
+
+Script: `.github/script/fast-merge-mergeable-prs.sh`
+
+#### Quick start
+
+```bash
+# Dry run (list what would happen):
+DRY_RUN=1 .github/script/fast-merge-mergeable-prs.sh
+
+# Run for real:
+.github/script/fast-merge-mergeable-prs.sh
+
+# Verbose output for external-PR details:
+VERBOSE=1 .github/script/fast-merge-mergeable-prs.sh
+```
+
+#### How it works
+
+| Phase | What happens |
+|-------|-------------|
+| **1** | GraphQL fetch — all open non-draft PRs with `mergeable` state in one call (typically < 5 s). External repos (not owned by you or your orgs) logged as `SKIP_EXTERNAL`. |
+| **2** | `MERGEABLE` PRs — immediate parallel merge (`--admin` by default). |
+| **3** | `UNKNOWN` PRs — re-check after Phase 2 delay; merge if now `MERGEABLE`. |
+| **4** | `CONFLICTING` SAST PRs — blobless clone (`--filter=blob:none`), `git merge -X ours` (keep PR side), push, then merge. Non-SAST → `SKIP_CONFLICT`. |
+
+**Result tags:**
+
+| Tag | Meaning |
+|-----|---------|
+| `[MERGED]` | Successfully merged |
+| `[MERGED_CONFLICT]` | Conflict auto-resolved and merged |
+| `[SKIP_EXTERNAL]` | Repo not owned by you/your orgs — skipped |
+| `[SKIP_CONFLICT]` | Non-SAST conflicting PR — fix manually |
+| `[SKIP_UNKNOWN]` | Still UNKNOWN after retry — re-run in a few minutes |
+| `[ERROR]` | Merge failed in owned repo (CI / branch protection / token scope) |
+| `[ERROR_CONFLICT]` | SAST conflict resolution failed (clone access / git history) |
+
+#### Key environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DRY_RUN` | 0 | Print actions only, no merges |
+| `MERGE_METHOD` | merge | `merge` / `squash` / `rebase` |
+| `MERGE_ADMIN` | 1 | `--admin` flag; bypasses branch protection |
+| `DELETE_BRANCH` | 0 | Delete head branch after merge |
+| `PARALLEL` | 8 | Concurrent workers for Phase 2 & 3 |
+| `CONFLICT_PARALLEL` | 4 | Concurrent workers for Phase 4 |
+| `GQL_TIMEOUT_SEC` | 60 | GraphQL fetch timeout (seconds) |
+| `VERBOSE` | 0 | Show `SKIP_EXTERNAL` PR details |
+| `FAST_MERGE_LOG` | — | Append all result lines to this file |
+
+---
+
+### `merge-branch.sh sast-prs` — sequential SAST sweep
 
 Script: `.github/script/merge-branch.sh` · Workflow: `.github/workflows/weekly-merge-sast-prs.yml`
 
-### Quick start
+#### Quick start
 
 ```bash
 # List only (no merges):
@@ -84,19 +142,19 @@ GH_SEARCH_TIMEOUT_SEC=120 MERGE_SEARCH_BY_AUTHOR=1 \
   .github/script/merge-branch.sh sast-prs
 ```
 
-### How it works
+#### How it works
 
 | Phase | Scope |
 |-------|-------|
 | Phase 1 | Your user namespace (`owner=LOGIN`) |
 | Phase 2 | Each org you belong to (`owner=ORG`), one at a time |
 
-- `MERGE_SEARCH_BY_AUTHOR=1` adds `--author LOGIN` to every `gh search prs` call — closest to "author:" on the GitHub web UI, and prevents one namespace's limit from crowding out another's.
+- `MERGE_SEARCH_BY_AUTHOR=1` adds `--author LOGIN` to every `gh search prs` call.
 - SAST PRs (title matches Snyk / Semgrep / Husky / CodeRabbit): if conflicting, the base is merged into the PR branch locally with `-X ours` (keeps the tool side), then pushed before the GitHub merge.
 - Non-SAST PRs with conflicts are skipped (resolve manually).
 - A 1 s sleep between merges prevents GitHub API rate-limiting (`MERGE_INTER_PR_SLEEP` to override).
 
-### Key environment variables
+#### Key environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -111,7 +169,9 @@ GH_SEARCH_TIMEOUT_SEC=120 MERGE_SEARCH_BY_AUTHOR=1 \
 
 ### Workflow permissions
 
-The workflow requires `pull-requests: write` and `contents: write` for `GITHUB_TOKEN` to approve and merge PRs. Without `SAST_MERGE_GITHUB_TOKEN` (a PAT with `repo` + `read:org`), merges are limited to this repository only.
+Both scripts require `pull-requests: write` and `contents: write` for `GITHUB_TOKEN`. Without `SAST_MERGE_GITHUB_TOKEN` (a PAT with `repo` + `read:org`), merges are limited to this repository only.
+
+To enable `fast-merge-mergeable-prs.sh` in the weekly workflow, trigger `workflow_dispatch` and set **fast_merge = true**.
 
 ---
 

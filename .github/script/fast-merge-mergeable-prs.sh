@@ -205,7 +205,10 @@ _resolve_conflict_worker() {
   workdir=$(mktemp -d)
   clone_url="https://x-access-token:${token}@github.com/${repo_full}.git"
 
-  if ! git clone --depth=200 --branch "$head_branch" \
+  # Use blobless clone: downloads full commit graph (needed for merge ancestor
+  # resolution) but skips file content blobs — much faster than a full clone
+  # and avoids the common-ancestor failure that --depth=N causes on long histories.
+  if ! git clone --filter=blob:none --branch "$head_branch" \
     "$clone_url" "$workdir" >/dev/null 2>&1; then
     printf '[ERROR_CONFLICT] %s %s#%s  clone failed\n' \
       "$ts" "$repo_full" "$num" >> "$out_file"
@@ -218,7 +221,7 @@ _resolve_conflict_worker() {
     cd "$workdir" || exit 1
     git config user.email "${GIT_AUTHOR_EMAIL:-${login}@users.noreply.github.com}"
     git config user.name  "${GIT_AUTHOR_NAME:-${login}}"
-    git fetch origin "$base_branch" --depth=200 >/dev/null 2>&1 || exit 1
+    git fetch origin "$base_branch" --filter=blob:none >/dev/null 2>&1 || exit 1
     git merge "origin/${base_branch}" \
       -m "Merge ${base_branch} into ${head_branch} (auto: favor PR side on conflicts)" \
       -X ours >/dev/null 2>&1 || exit 1
@@ -344,6 +347,11 @@ MY_LOGIN=$(gh api user -q .login 2>/dev/null) || {
   echo "error: gh api user failed; run: gh auth login" >&2; exit 1
 }
 
+# Fetch orgs once so we can identify repos where user has (likely) write access.
+# PRs in repos whose owner is not MY_LOGIN and not one of MY_ORGS are flagged
+# SKIP_EXTERNAL — the user opened a PR in someone else's project.
+MY_ORGS_JSON=$(gh api user/orgs --paginate -q '[.[].login]' 2>/dev/null) || MY_ORGS_JSON='[]'
+
 FM_METHOD="${MERGE_METHOD:-merge}"
 FM_ADMIN="${MERGE_ADMIN:-1}"
 FM_DEL="${DELETE_BRANCH:-0}"
@@ -373,17 +381,43 @@ t1=$SECONDS
 TOTAL=$(printf '%s' "$ALL_PRS" | jq 'length')
 log_line "==> Fetched ${TOTAL} open non-draft PR(s) in $((t1 - t0))s"
 
-MERGEABLE_PRS=$(printf '%s' "$ALL_PRS"   | jq '[.[] | select(.mergeable == "MERGEABLE")]')
-CONFLICTING_PRS=$(printf '%s' "$ALL_PRS" | jq '[.[] | select(.mergeable == "CONFLICTING")]')
-UNKNOWN_PRS=$(printf '%s' "$ALL_PRS"     | jq '[.[] | select(.mergeable == "UNKNOWN")]')
+# Split external PRs (repos not owned by user or their orgs) upfront so they
+# don't show as confusing [ERROR] lines — they are SKIP_EXTERNAL by design.
+OWNED_PRS=$(printf '%s' "$ALL_PRS" | jq \
+  --arg login "$MY_LOGIN" \
+  --argjson orgs "$MY_ORGS_JSON" \
+  '[.[] | (.repository.nameWithOwner | split("/")[0]) as $owner |
+    select($owner == $login or ($orgs | index($owner) != null))]')
+
+EXTERNAL_PRS=$(printf '%s' "$ALL_PRS" | jq \
+  --arg login "$MY_LOGIN" \
+  --argjson orgs "$MY_ORGS_JSON" \
+  '[.[] | (.repository.nameWithOwner | split("/")[0]) as $owner |
+    select($owner != $login and ($orgs | index($owner) == null))]')
+
+EC=$(printf '%s' "$EXTERNAL_PRS" | jq 'length')
+if [[ "$EC" -gt 0 ]]; then
+  log_line "==> SKIP_EXTERNAL: ${EC} PR(s) in repos you do not own (opened PR in someone else's project)"
+  _TOTAL_SKIPPED=$((_TOTAL_SKIPPED + EC))
+  if [[ "${VERBOSE:-0}" == "1" ]]; then
+    printf '%s' "$EXTERNAL_PRS" | jq -r '.[] |
+      "[SKIP_EXTERNAL] " + .repository.nameWithOwner + "#" + (.number|tostring) + "  " + .url' \
+      | while IFS= read -r line; do log_line "$line"; done
+  fi
+fi
+
+MERGEABLE_PRS=$(printf '%s' "$OWNED_PRS"   | jq '[.[] | select(.mergeable == "MERGEABLE")]')
+CONFLICTING_PRS=$(printf '%s' "$OWNED_PRS" | jq '[.[] | select(.mergeable == "CONFLICTING")]')
+UNKNOWN_PRS=$(printf '%s' "$OWNED_PRS"     | jq '[.[] | select(.mergeable == "UNKNOWN")]')
 
 MC=$(printf '%s' "$MERGEABLE_PRS"   | jq 'length')
 CC=$(printf '%s' "$CONFLICTING_PRS" | jq 'length')
 UC=$(printf '%s' "$UNKNOWN_PRS"     | jq 'length')
 
-log_line "==> Partition: MERGEABLE=${MC}  CONFLICTING=${CC}  UNKNOWN=${UC}"
+log_line "==> Owned PRs: MERGEABLE=${MC}  CONFLICTING=${CC}  UNKNOWN=${UC}  (external skipped=${EC})"
 
-[[ "$TOTAL" -eq 0 ]] && { log_line "==> Nothing to do."; exit 0; }
+OWNED=$(printf '%s' "$OWNED_PRS" | jq 'length')
+[[ "$OWNED" -eq 0 ]] && { log_line "==> Nothing to do in owned repos."; exit 0; }
 
 TMP_DIR=$(mktemp -d)
 
@@ -425,8 +459,9 @@ log_line "==> TOTAL SUMMARY"
 log_line "    merged=${_TOTAL_MERGED}  errors=${_TOTAL_ERRORS}  skipped=${_TOTAL_SKIPPED}  dry_run=${_TOTAL_DRY}"
 log_line ""
 log_line "  [ERROR] causes:"
-log_line "    EXTERNAL — opened PR in a repo you cannot write to (close it or ask maintainer)"
-log_line "    OWN_REPO — CI failing / branch protection / token missing repo scope"
-log_line "  [SKIP_CONFLICT] — non-SAST conflicting PR: rebase your branch or run merge-branch.sh"
-log_line "  [SKIP_UNKNOWN]  — GitHub still computing mergeability: run script again in a few minutes"
+log_line "    merge_exit!=0 in owned repo — CI failing / branch protection / token missing repo scope"
+log_line "  [SKIP_EXTERNAL]  — PR in a repo not owned by you or your orgs; filtered before attempts"
+log_line "  [SKIP_CONFLICT]  — non-SAST conflicting PR: rebase your branch or run merge-branch.sh"
+log_line "  [SKIP_UNKNOWN]   — GitHub still computing mergeability: re-run in a few minutes"
+log_line "  [ERROR_CONFLICT] — SAST conflict resolution failed: check clone access / git history"
 log_line "===================================================================="

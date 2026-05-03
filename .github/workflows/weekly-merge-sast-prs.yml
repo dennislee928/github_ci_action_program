@@ -1,21 +1,35 @@
-# Runs .github/script/merge-branch.sh sast-prs on a timer.
+# Runs .github/script/merge-branch.sh sast-prs (and optionally fast-merge-mergeable-prs.sh)
+# on a timer or manual trigger.
 #
-# Script behavior (see script comments): Phase 1 — PRs under your user namespace, then
-# Phase 2 — each org (non-draft). Optional MERGE_SEARCH_BY_AUTHOR=1 adds --author (your PRs only).
-# Merge when GitHub says mergeable; GH_SEARCH_TIMEOUT_SEC caps each search (e.g. 120).
+# Script behavior (see script comments):
+#   merge-branch.sh — Phase 1: PRs under your user namespace, then each org (non-draft).
+#   fast-merge-mergeable-prs.sh — 4-phase parallel merge using GraphQL; runs first.
 #
-# Optional secret SAST_MERGE_GITHUB_TOKEN: PAT so gh/git can merge PRs in other repos
-# (classic "repo" + read:org, or fine-grained on those repos). Without it, Actions
-# GITHUB_TOKEN only affects *this* repository.
+# Required permissions: pull-requests: write + contents: write.
+#
+# Optional secret SAST_MERGE_GITHUB_TOKEN: PAT (classic "repo" + read:org, or fine-grained)
+#   so gh/git can merge PRs in other repos. Without it, GITHUB_TOKEN only affects *this* repo.
 #
 # Optional env overrides (uncomment / set below):
-#   MERGE_ONLY_SAST=1   — only titles matching Snyk/Semgrep/Husky/CodeRabbit
-#   DRY_RUN=1           — list actions only
-#   MERGE_ADMIN=1       — gh pr merge --admin when checks block
+#   MERGE_ONLY_SAST=1      — only titles matching Snyk/Semgrep/Husky/CodeRabbit
+#   DRY_RUN=1              — list actions only
+#   MERGE_ADMIN=1          — gh pr merge --admin (bypasses branch protection)
+#   FAST_MERGE=1           — run fast-merge-mergeable-prs.sh before merge-branch.sh
 name: Weekly PR merge automation
 
 on:
   workflow_dispatch:
+    inputs:
+      fast_merge:
+        description: "Run fast-merge-mergeable-prs.sh (4-phase parallel merge) before merge-branch.sh"
+        required: false
+        default: false
+        type: boolean
+      dry_run:
+        description: "Dry run (list only, no actual merges)"
+        required: false
+        default: false
+        type: boolean
   # 若改由 Cloudflare Worker cron 觸發（見 .github/script/cloudflare_workers/），
   # 可註解掉下方 schedule，避免與 Workers 重複執行。
   schedule:
@@ -37,15 +51,36 @@ jobs:
     timeout-minutes: 120
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
 
-      - name: Run PR automation script
+      - name: Fast-merge mergeable PRs (optional)
+        if: ${{ github.event.inputs.fast_merge == 'true' }}
         env:
           PAT: ${{ secrets.SAST_MERGE_GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
+          MERGE_ADMIN: "1"
+          # PARALLEL: "8"
+          # CONFLICT_PARALLEL: "4"
+          # GQL_TIMEOUT_SEC: "60"
+          # DELETE_BRANCH: "0"
+        run: |
+          set -euo pipefail
+          if [ -n "${PAT:-}" ]; then
+            export GH_TOKEN="$PAT"
+          else
+            export GH_TOKEN="$GITHUB_TOKEN"
+            echo "::warning title=SAST_MERGE_GITHUB_TOKEN::Secret not set — using GITHUB_TOKEN. Merges limited to this repository."
+          fi
+          bash "${GITHUB_WORKSPACE}/.github/script/fast-merge-mergeable-prs.sh"
+
+      - name: Run PR automation script (merge-branch.sh)
+        env:
+          PAT: ${{ secrets.SAST_MERGE_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && '1' || '0' }}
           # Optional overrides for scheduled/manual runs (edit here or use repo Variables).
           # MERGE_ONLY_SAST: "1"
-          # DRY_RUN: "1"
           # GH_SEARCH_TIMEOUT_SEC: "120"
           # MERGE_SEARCH_PROGRESS_SEC: "15"   # non-verbose heartbeat during gh search; "0" = off
           # MERGE_SEARCH_BY_AUTHOR: "1"
