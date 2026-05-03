@@ -1,0 +1,38 @@
+# Runs merge-branch.sh in SAST mode once per week to approve/merge tooling PRs
+# (Snyk, Semgrep, Husky, CodeRabbit titles) on repos you own or belong to your orgs.
+#
+# Cross-repository merges need a Personal Access Token stored as repo secret
+# SAST_MERGE_GITHUB_TOKEN (e.g. classic PAT with "repo" + read:org, or fine-grained
+# with Pull requests and Contents on selected repositories).
+name: Weekly merge SAST PRs
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every Monday 09:00 UTC; change if you prefer another day/time.
+    - cron: "0 9 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  merge_sast_prs:
+    name: Run merge-branch.sh sast-prs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Merge SAST/tooling PRs
+        env:
+          PAT: ${{ secrets.SAST_MERGE_GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PAT:-}" ]; then
+            export GH_TOKEN="$PAT"
+          else
+            export GH_TOKEN="$GITHUB_TOKEN"
+            echo "::warning title=SAST_MERGE_GITHUB_TOKEN::Repository secret not set; using default GITHUB_TOKEN. Only PRs in this repository can be merged. Add SAST_MERGE_GITHUB_TOKEN for merges across your other repos/orgs."
+          fi
+          bash "${GITHUB_WORKSPACE}/.github/script/merge-branch.sh" sast-prs

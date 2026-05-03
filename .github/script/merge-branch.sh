@@ -4,8 +4,9 @@
 #
 # MODES
 # 1) CI branch merge (legacy): requires env branch1 and branch2
-# 2) SAST PR automation: ./merge-branch.sh sast-prs
-#    or: MERGE_SAST_PRS=1 ./merge-branch.sh
+# 2) SAST PR automation (from repo root):
+#      .github/script/merge-branch.sh sast-prs
+#    or: MERGE_SAST_PRS=1 .github/script/merge-branch.sh
 #
 # SAST mode lists your open PRs, keeps only repos you own or belong to your orgs,
 # matches titles for Snyk / Semgrep / Husky / CodeRabbit (case-insensitive), then
@@ -16,9 +17,9 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  CI merge (env):  branch1=origin/main branch2=ci ./merge-branch.sh
-  SAST PRs:        ./merge-branch.sh sast-prs
-                   MERGE_SAST_PRS=1 ./merge-branch.sh
+  CI merge (env):  branch1=origin/main branch2=ci .github/script/merge-branch.sh
+  SAST PRs:        .github/script/merge-branch.sh sast-prs
+                   DRY_RUN=1 .github/script/merge-branch.sh sast-prs
 
 Environment (SAST mode):
   DRY_RUN=1          Only print actions, no approve/merge
