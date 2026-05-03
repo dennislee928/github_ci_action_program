@@ -18,6 +18,12 @@
 
 set -euo pipefail
 
+# stderr-only; does not affect stdout JSON capture.
+v_log() {
+  [[ "${MERGE_SCRIPT_VERBOSE:-0}" == "1" ]] || return 0
+  echo "[verbose $(date '+%H:%M:%S')] $*" >&2
+}
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -26,6 +32,8 @@ Usage:
                    DRY_RUN=1 .github/script/merge-branch.sh sast-prs
 
 Environment (PR mode):
+  VERBOSE=1 / MERGE_VERBOSE=1   Log each gh search (timing + result count) to stderr
+  sast-prs -v / --verbose       Same as VERBOSE=1
   DRY_RUN=1           Print actions only
   MERGE_METHOD=merge  merge | squash | rebase (default: merge)
   MERGE_ADMIN=1       gh pr merge --admin when checks block merge
@@ -82,25 +90,38 @@ collect_open_prs_in_namespaces() {
   local limit="${1:-100}"
   local combined='[]'
   local raw chunk
+  local t0 t1 n
 
   # Use gh structured flags (--owner, --draft=false). Free-text queries like
   # user:LOGIN / -draft:true often return [] even when the web UI lists PRs.
   # Progress must go to stderr — stdout is only the final JSON array for json=$(...) capture.
   echo "==> Searching open PRs: owner=${MY_LOGIN} (non-draft) ..." >&2
+  v_log "gh search prs --owner ${MY_LOGIN} --limit ${limit} (calling GitHub API…)"
+  t0=$SECONDS
   raw=$(gh search prs --owner "$MY_LOGIN" --state open --draft=false \
     --json number,title,url,repository --limit "$limit" 2>/dev/null) || raw=''
+  t1=$SECONDS
   chunk=$(normalize_gh_search_json "$raw")
+  n=$(echo "$chunk" | jq 'length')
+  v_log "owner=${MY_LOGIN} done in $((t1 - t0))s — PRs in this page: ${n}"
   combined=$(jq -n --argjson a "$combined" --argjson b "$chunk" '$a + $b')
 
   local org
   for org in "${MY_ORGS[@]}"; do
     echo "==> Searching open PRs: owner=${org} (non-draft) ..." >&2
+    v_log "gh search prs --owner ${org} --limit ${limit} (calling GitHub API…)"
+    t0=$SECONDS
     raw=$(gh search prs --owner "$org" --state open --draft=false \
       --json number,title,url,repository --limit "$limit" 2>/dev/null) || raw=''
+    t1=$SECONDS
     chunk=$(normalize_gh_search_json "$raw")
+    n=$(echo "$chunk" | jq 'length')
+    v_log "owner=${org} done in $((t1 - t0))s — PRs in this page: ${n}"
     combined=$(jq -n --argjson a "$combined" --argjson b "$chunk" '$a + $b')
   done
 
+  n=$(echo "$combined" | jq 'length')
+  v_log "after dedupe(unique_by url): combined_count=${n}"
   echo "$combined" | jq 'unique_by(.url)'
 }
 
