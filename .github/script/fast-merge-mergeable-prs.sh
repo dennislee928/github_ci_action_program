@@ -24,7 +24,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 log_line() {
   local msg="$1"
   echo "$msg"
-  echo "$msg" >&2
   [[ -n "${FAST_MERGE_LOG:-}" ]] && echo "$msg" >>"${FAST_MERGE_LOG}"
 }
 
@@ -109,16 +108,20 @@ admin_flag=()
 [[ "${MERGE_ADMIN:-1}" == "1" ]] && admin_flag+=(--admin)
 DELETE_FLAG=()
 [[ "${DELETE_BRANCH:-0}" == "1" ]] && DELETE_FLAG+=(--delete-branch)
-tout="${GH_SEARCH_TIMEOUT_SEC:-0}"
+# 預設 120s 避免 gh search 無限卡住；若要不限時請設 GH_SEARCH_TIMEOUT_SEC=0
+tout="${GH_SEARCH_TIMEOUT_SEC:-120}"
 
 log_line "==> fast-merge-mergeable-prs: login=${MY_LOGIN} PR_LIMIT=${limit} MERGE_METHOD=${method} MERGE_ADMIN=${MERGE_ADMIN:-1} DRY_RUN=${dry} GH_SEARCH_TIMEOUT_SEC=${tout}"
 
-echo "==> Searching open PRs (author=${MY_LOGIN}, non-draft) …" >&2
+log_line "==> Searching open PRs (author=${MY_LOGIN}, non-draft) …"
+log_line "    Next line appears after GitHub returns (often 30s–several min). Heartbeat every ${FAST_MERGE_PROGRESS_SEC:-15}s; FAST_MERGE_PROGRESS_SEC=0 disables."
+_fast_search_progress_start
 set +e
 raw=$(run_with_timeout_sec "$tout" gh search prs --author "$MY_LOGIN" --state open --draft=false \
   --json number,title,url,repository --limit "$limit" 2>/dev/null)
 search_ec=$?
 set -e
+_fast_search_progress_stop
 
 if [[ "$search_ec" -eq 124 ]]; then
   echo "error: search timed out; increase GH_SEARCH_TIMEOUT_SEC or check network." >&2
