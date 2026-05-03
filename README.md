@@ -68,33 +68,50 @@ First, let's add a workflow to lint (clean, like a lint roller) our Markdown fil
 
 ---
 
-GH_SEARCH_TIMEOUT_SEC
-新增 run_with_timeout_sec：會依序嘗試 timeout、gtimeout，否則用 bash 背景程序送 SIGTERM。
-0 或未設定：不加逾時（維持以往行為）。
-gh search prs 逾時：在 stderr 印錯誤，該次搜尋視為 []，流程會繼續下一階段。
-MERGE_SEARCH_BY_AUTHOR=1
-每次搜尋改為：gh search prs --author "$MY_LOGIN" --owner <命名空間>，較接近網頁的 author:，且仍限定在你的 user / 各 org 底下。
-MERGE_SEARCH_BY_AUTHOR 未設或為 0：維持原本的 --owner only（該命名空間底下所有 open PR，不限作者）。
-順序：個人 repo → 各 org
-Phase 1：只對 owner=$MY_LOGIN 搜尋並跑完整 merge 流程。
-Phase 2：對 MY_ORGS 裡每個 org 各搜尋一次並各自 merge。
-每個 phase 內仍會做 repo_owner_allowed、SAST / mergeable / try_approve_and_merge 等既有邏輯。
-檔案
-.github/script/merge-branch.sh：上述邏輯與 merge_pull_requests_from_json 抽出共用。
-.github/workflows/weekly-merge-sast-prs.yml：註解裡加上可選的 GH_SEARCH_TIMEOUT_SEC、MERGE_SEARCH_BY_AUTHOR。
-2. 使用範例
-貼近網頁「你開的 PR」、先個人再 org，並為每次 search 加上 120 秒上限：
+## PR Automation (`merge-branch.sh sast-prs`)
 
-GH_SEARCH_TIMEOUT_SEC=120 MERGE_SEARCH_BY_AUTHOR=1 \
-  .github/script/merge-branch.sh sast-prs
-只看（不 merge）：
+Script: `.github/script/merge-branch.sh` · Workflow: `.github/workflows/weekly-merge-sast-prs.yml`
 
+### Quick start
+
+```bash
+# List only (no merges):
 DRY_RUN=1 GH_SEARCH_TIMEOUT_SEC=120 MERGE_SEARCH_BY_AUTHOR=1 \
   .github/script/merge-branch.sh sast-prs
-3. 為什麼這樣設計
---author + --owner：同一個 author 搜尋在不同命名空間分段做，避免「單一 limit 把個人 PR 塞滿、org PR 完全撈不到」。
-Phase 1 → Phase 2：符合你要的「先處理個人 repo，再處理 org」。
-逾時：避免 gh search 無限卡住；可依網路環境調高（例如 300）。
+
+# Run for real — your PRs only, 120 s search cap:
+GH_SEARCH_TIMEOUT_SEC=120 MERGE_SEARCH_BY_AUTHOR=1 \
+  .github/script/merge-branch.sh sast-prs
+```
+
+### How it works
+
+| Phase | Scope |
+|-------|-------|
+| Phase 1 | Your user namespace (`owner=LOGIN`) |
+| Phase 2 | Each org you belong to (`owner=ORG`), one at a time |
+
+- `MERGE_SEARCH_BY_AUTHOR=1` adds `--author LOGIN` to every `gh search prs` call — closest to "author:" on the GitHub web UI, and prevents one namespace's limit from crowding out another's.
+- SAST PRs (title matches Snyk / Semgrep / Husky / CodeRabbit): if conflicting, the base is merged into the PR branch locally with `-X ours` (keeps the tool side), then pushed before the GitHub merge.
+- Non-SAST PRs with conflicts are skipped (resolve manually).
+- A 1 s sleep between merges prevents GitHub API rate-limiting (`MERGE_INTER_PR_SLEEP` to override).
+
+### Key environment variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `GH_SEARCH_TIMEOUT_SEC` | 0 (none) | Cap each `gh search prs` call (recommended: `120`) |
+| `MERGE_SEARCH_BY_AUTHOR` | 0 | Restrict search to your PRs (`--author LOGIN`) |
+| `MERGE_INTER_PR_SLEEP` | 1 | Seconds between sequential merges |
+| `DRY_RUN` | 0 | Print actions only, no merges |
+| `MERGE_METHOD` | merge | `merge` / `squash` / `rebase` |
+| `MERGE_ADMIN` | 0 | `gh pr merge --admin` (bypasses branch protection) |
+| `DELETE_BRANCH` | 0 | Delete PR branch after merge |
+| `MERGE_ONLY_SAST` | 0 | Only process SAST-keyword PRs |
+
+### Workflow permissions
+
+The workflow requires `pull-requests: write` and `contents: write` for `GITHUB_TOKEN` to approve and merge PRs. Without `SAST_MERGE_GITHUB_TOKEN` (a PAT with `repo` + `read:org`), merges are limited to this repository only.
 
 ---
 
