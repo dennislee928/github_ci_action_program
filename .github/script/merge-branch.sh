@@ -121,7 +121,7 @@ collect_open_prs_in_namespaces() {
   done
 
   n=$(echo "$combined" | jq 'length')
-  v_log "after dedupe(unique_by url): combined_count=${n}"
+  v_log "before unique_by(.url): merged_rows=${n}"
   echo "$combined" | jq 'unique_by(.url)'
 }
 
@@ -209,7 +209,8 @@ merge_all_pull_requests() {
   [[ "${DELETE_BRANCH:-0}" == "1" ]] && DELETE_FLAG_ARR+=(--delete-branch)
 
   echo "==> Logged in as: $MY_LOGIN"
-  echo "==> Orgs: ${MY_ORGS[*]:-(none)}"
+  echo "==> Orgs (${#MY_ORGS[@]}): ${MY_ORGS[*]:-(none)}"
+  v_log "PR_LIMIT=${limit} DRY_RUN=${dry} MERGE_ONLY_SAST=${only_sast} MERGE_ADMIN=${MERGE_ADMIN:-0}"
 
   local json
   json=$(collect_open_prs_in_namespaces "$limit")
@@ -217,6 +218,7 @@ merge_all_pull_requests() {
   local count
   count=$(echo "$json" | jq 'length')
   echo "==> Unique open PRs (user + org searches): $count"
+  v_log "json bytes=${#json} (stdout from collect must be JSON only)"
 
   echo "$json" | jq -c '.[]' | while read -r row; do
     local title url repo_full owner num mergeable sast
@@ -257,6 +259,7 @@ merge_all_pull_requests() {
     fi
 
     mergeable=$(gh pr view "$num" --repo "$repo_full" --json mergeable -q .mergeable)
+    v_log "PR ${repo_full}#${num} mergeable=${mergeable}"
 
     if [[ "$mergeable" == "UNKNOWN" ]]; then
       echo "skip: mergeability unknown (wait and retry)"
@@ -298,6 +301,12 @@ merge_all_pull_requests() {
 
 # --- Mode: PR automation ---
 if [[ "${1:-}" == "sast-prs" ]] || [[ "${MERGE_SAST_PRS:-}" == "1" ]]; then
+  MERGE_SCRIPT_VERBOSE="${MERGE_SCRIPT_VERBOSE:-0}"
+  [[ "${VERBOSE:-0}" == "1" || "${MERGE_VERBOSE:-0}" == "1" ]] && MERGE_SCRIPT_VERBOSE=1
+  if [[ "${2:-}" == "-v" || "${2:-}" == "--verbose" ]]; then
+    MERGE_SCRIPT_VERBOSE=1
+  fi
+  export MERGE_SCRIPT_VERBOSE
   merge_all_pull_requests
   exit 0
 fi
