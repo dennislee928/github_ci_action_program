@@ -147,6 +147,7 @@ Environment (PR mode):
   MERGE_SEARCH_PROGRESS_SEC   Non-verbose: heartbeat interval during gh search (default 15; 0 = off)
   GH_SEARCH_TIMEOUT_SEC   Seconds; caps each gh search prs call (0/unset = no cap). Ex: 120
   MERGE_SEARCH_BY_AUTHOR=1  Add --author LOGIN to each search (your PRs only), still scoped per owner phase
+  MERGE_INTER_PR_SLEEP=1  Seconds to sleep between sequential PR merges (default 1; prevents rate-limiting)
   MERGE_LOG_FILE=path   Write full session log to this file (default: .github/script/merge-branch-*.log)
   MERGE_LOG_DISABLE=1   Do not write a session log file (console only)
 
@@ -199,60 +200,45 @@ normalize_gh_search_json() {
 # PRs authored by MY_LOGIN (--author + --owner), matching the web “author:” experience.
 # Prints JSON array on stdout; progress on stderr.
 search_prs_for_owner_namespace() {
-  local owner_ns="$1"
-  local limit="${2:-300}"
-  local use_author="${3:-0}"
-  local raw="" chunk="" t0 t_end n search_ec=0
-  local tout="${GH_SEARCH_TIMEOUT_SEC:-0}"
+  local owner_ns=”$1”
+  local limit=”${2:-300}”
+  local use_author=”${3:-0}”
+  local raw=”” chunk=”” t0 t_end n search_ec=0
+  local tout=”${GH_SEARCH_TIMEOUT_SEC:-0}”
+  local label gh_extra_args=()
 
-  t0=$SECONDS
-  if [[ "$use_author" == "1" ]]; then
-    echo "==> Searching PRs: author=${MY_LOGIN} owner=${owner_ns} (non-draft) …" >&2
-    v_log "gh search prs --author ${MY_LOGIN} --owner ${owner_ns} --limit ${limit} (timeout=${tout}s)"
-    gh_heartbeat_start "author ${MY_LOGIN} owner ${owner_ns}"
-    set +e
-    raw=$(run_with_timeout_sec "$tout" gh search prs --author "$MY_LOGIN" --owner "$owner_ns" --state open --draft=false \
-      --json number,title,url,repository --limit "$limit" 2>/dev/null)
-    search_ec=$?
-    set -e
-    gh_heartbeat_stop
-    if [[ "$search_ec" -eq 124 ]]; then
-      t_end=$SECONDS
-      echo "error: gh search timed out for namespace ${owner_ns} (GH_SEARCH_TIMEOUT_SEC=${tout})." >&2
-      echo "==> Searching PRs: author=${MY_LOGIN} owner=${owner_ns} (non-draft) … : used $(format_duration_human $((t_end - t0))) — 0 PR(s), gh exit ${search_ec}" >&2
-      echo '[]'
-      return 0
-    fi
-    chunk=$(normalize_gh_search_json "$raw")
-    n=$(echo "$chunk" | jq 'length')
-    t_end=$SECONDS
-    v_log "author+owner=${owner_ns} — PRs: ${n} exit=${search_ec} wall=$((t_end - t0))s"
-    echo "==> Searching PRs: author=${MY_LOGIN} owner=${owner_ns} (non-draft) … : used $(format_duration_human $((t_end - t0))) — ${n} PR(s), gh exit ${search_ec}" >&2
+  if [[ “$use_author” == “1” ]]; then
+    label=”author=${MY_LOGIN} owner=${owner_ns}”
+    gh_extra_args=(--author “$MY_LOGIN”)
   else
-    echo "==> Searching open PRs: owner=${owner_ns} (non-draft) …" >&2
-    v_log "gh search prs --owner ${owner_ns} --limit ${limit} (timeout=${tout}s)"
-    gh_heartbeat_start "owner ${owner_ns}"
-    set +e
-    raw=$(run_with_timeout_sec "$tout" gh search prs --owner "$owner_ns" --state open --draft=false \
-      --json number,title,url,repository --limit "$limit" 2>/dev/null)
-    search_ec=$?
-    set -e
-    gh_heartbeat_stop
-    if [[ "$search_ec" -eq 124 ]]; then
-      t_end=$SECONDS
-      echo "error: gh search timed out for namespace ${owner_ns} (GH_SEARCH_TIMEOUT_SEC=${tout})." >&2
-      echo "==> Searching open PRs: owner=${owner_ns} (non-draft) … : used $(format_duration_human $((t_end - t0))) — 0 PR(s), gh exit ${search_ec}" >&2
-      echo '[]'
-      return 0
-    fi
-    chunk=$(normalize_gh_search_json "$raw")
-    n=$(echo "$chunk" | jq 'length')
-    t_end=$SECONDS
-    v_log "owner=${owner_ns} — PRs: ${n} exit=${search_ec} wall=$((t_end - t0))s"
-    echo "==> Searching open PRs: owner=${owner_ns} (non-draft) … : used $(format_duration_human $((t_end - t0))) — ${n} PR(s), gh exit ${search_ec}" >&2
+    label=”owner=${owner_ns}”
   fi
 
-  echo "$chunk" | jq 'unique_by(.url)'
+  t0=$SECONDS
+  echo “==> Searching PRs: ${label} (non-draft) …” >&2
+  v_log “gh search prs ${gh_extra_args[*]+”${gh_extra_args[*]}”} --owner ${owner_ns} --limit ${limit} (timeout=${tout}s)”
+  gh_heartbeat_start “${label}”
+  set +e
+  raw=$(run_with_timeout_sec “$tout” gh search prs “${gh_extra_args[@]+”${gh_extra_args[@]}”}” \
+    --owner “$owner_ns” --state open --draft=false \
+    --json number,title,url,repository --limit “$limit” 2>/dev/null)
+  search_ec=$?
+  set -e
+  gh_heartbeat_stop
+
+  t_end=$SECONDS
+  if [[ “$search_ec” -eq 124 ]]; then
+    echo “error: gh search timed out for namespace ${owner_ns} (GH_SEARCH_TIMEOUT_SEC=${tout}).” >&2
+    echo “==> Searching PRs: ${label} … : used $(format_duration_human $((t_end - t0))) — 0 PR(s), gh exit ${search_ec}” >&2
+    echo '[]'
+    return 0
+  fi
+
+  chunk=$(normalize_gh_search_json “$raw”)
+  n=$(echo “$chunk” | jq 'length')
+  v_log “${label} — PRs: ${n} exit=${search_ec} wall=$((t_end - t0))s”
+  echo “==> Searching PRs: ${label} … : used $(format_duration_human $((t_end - t0))) — ${n} PR(s), gh exit ${search_ec}” >&2
+  echo “$chunk” | jq 'unique_by(.url)'
 }
 
 merge_pull_requests_from_json() {
