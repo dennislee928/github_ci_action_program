@@ -32,6 +32,10 @@ Environment (PR mode):
   DELETE_BRANCH=1     gh pr merge --delete-branch
   PR_LIMIT=100        Per search query cap (default 100)
   MERGE_ONLY_SAST=1   Only process PRs whose title matches SAST keywords (legacy)
+
+Note: You must pass "sast-prs" for GitHub PR mode. Running the script with no args
+      does nothing useful. Do not copy "git push origin $branch2" into your shell
+      unless branch1/branch2 are set (normally only set by CI).
 EOF
 }
 
@@ -167,7 +171,8 @@ merge_all_pull_requests() {
   local method="${MERGE_METHOD:-merge}"
   local only_sast="${MERGE_ONLY_SAST:-0}"
   local admin_flag=()
-  declare -ga DELETE_FLAG_ARR=()
+  # Bash 3.2 (macOS default) has no "declare -g"; plain assignment is global in a function.
+  DELETE_FLAG_ARR=()
   [[ "${MERGE_ADMIN:-0}" == "1" ]] && admin_flag+=(--admin)
   [[ "${DELETE_BRANCH:-0}" == "1" ]] && DELETE_FLAG_ARR+=(--delete-branch)
 
@@ -267,6 +272,11 @@ fi
 
 # --- Mode: show usage if no CI vars ---
 if [[ -z "${branch1:-}" || -z "${branch2:-}" ]]; then
+  echo >&2 ""
+  echo >&2 "merge-branch.sh: 未選模式。若要自動處理 GitHub PR，請加上第一個參數: sast-prs"
+  echo >&2 "  例: .github/script/merge-branch.sh sast-prs"
+  echo >&2 "  或: DRY_RUN=1 .github/script/merge-branch.sh sast-prs"
+  echo >&2 ""
   usage
   exit 1
 fi
