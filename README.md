@@ -68,6 +68,36 @@ First, let's add a workflow to lint (clean, like a lint roller) our Markdown fil
 
 ---
 
+GH_SEARCH_TIMEOUT_SEC
+新增 run_with_timeout_sec：會依序嘗試 timeout、gtimeout，否則用 bash 背景程序送 SIGTERM。
+0 或未設定：不加逾時（維持以往行為）。
+gh search prs 逾時：在 stderr 印錯誤，該次搜尋視為 []，流程會繼續下一階段。
+MERGE_SEARCH_BY_AUTHOR=1
+每次搜尋改為：gh search prs --author "$MY_LOGIN" --owner <命名空間>，較接近網頁的 author:，且仍限定在你的 user / 各 org 底下。
+MERGE_SEARCH_BY_AUTHOR 未設或為 0：維持原本的 --owner only（該命名空間底下所有 open PR，不限作者）。
+順序：個人 repo → 各 org
+Phase 1：只對 owner=$MY_LOGIN 搜尋並跑完整 merge 流程。
+Phase 2：對 MY_ORGS 裡每個 org 各搜尋一次並各自 merge。
+每個 phase 內仍會做 repo_owner_allowed、SAST / mergeable / try_approve_and_merge 等既有邏輯。
+檔案
+.github/script/merge-branch.sh：上述邏輯與 merge_pull_requests_from_json 抽出共用。
+.github/workflows/weekly-merge-sast-prs.yml：註解裡加上可選的 GH_SEARCH_TIMEOUT_SEC、MERGE_SEARCH_BY_AUTHOR。
+2. 使用範例
+貼近網頁「你開的 PR」、先個人再 org，並為每次 search 加上 120 秒上限：
+
+GH_SEARCH_TIMEOUT_SEC=120 MERGE_SEARCH_BY_AUTHOR=1 \
+  .github/script/merge-branch.sh sast-prs
+只看（不 merge）：
+
+DRY_RUN=1 GH_SEARCH_TIMEOUT_SEC=120 MERGE_SEARCH_BY_AUTHOR=1 \
+  .github/script/merge-branch.sh sast-prs
+3. 為什麼這樣設計
+--author + --owner：同一個 author 搜尋在不同命名空間分段做，避免「單一 limit 把個人 PR 塞滿、org PR 完全撈不到」。
+Phase 1 → Phase 2：符合你要的「先處理個人 repo，再處理 org」。
+逾時：避免 gh search 無限卡住；可依網路環境調高（例如 300）。
+
+---
+
 Get help: [Post in our discussion board](https://github.com/orgs/skills/discussions/categories/test-with-actions) &bull; [Review the GitHub status page](https://www.githubstatus.com/)
 
 &copy; 2023 GitHub &bull; [Code of Conduct](https://www.contributor-covenant.org/version/2/1/code_of_conduct/code_of_conduct.md) &bull; [MIT License](https://gh.io/mit)
