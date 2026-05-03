@@ -246,7 +246,9 @@ merge_all_pull_requests() {
   echo "==> Unique open PRs (user + org searches): $count"
   v_log "json bytes=${#json} (stdout from collect must be JSON only)"
 
-  echo "$json" | jq -c '.[]' | while read -r row; do
+  # Process substitution keeps this loop in the same shell as merge_all_pull_requests.
+  # A pipe to `while` would fork a subshell where local admin_flag is unset (set -u error).
+  while read -r row; do
     local title url repo_full owner num mergeable sast
     title=$(echo "$row" | jq -r '.title')
     url=$(echo "$row" | jq -r '.url')
@@ -319,7 +321,7 @@ merge_all_pull_requests() {
     else
       echo "merge failed (checks, reviews, or permissions). Try MERGE_ADMIN=1 or fix CI."
     fi
-  done
+  done < <(echo "$json" | jq -c '.[]')
 
   echo ""
   echo "Done."
