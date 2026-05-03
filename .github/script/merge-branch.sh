@@ -68,28 +68,37 @@ repo_owner_allowed() {
   return 1
 }
 
+# gh search --json must yield an array; empty, errors, or API objects become [].
+normalize_gh_search_json() {
+  local raw="$1"
+  [[ -z "${raw//[$'\t\r\n ']/}" ]] && {
+    echo '[]'
+    return 0
+  }
+  echo "$raw" | jq -c 'if type == "array" then . else [] end' 2>/dev/null || echo '[]'
+}
+
 collect_open_prs_in_namespaces() {
   local limit="${1:-100}"
-  local parts=()
+  local combined='[]'
+  local raw chunk q
 
-  echo "==> Searching open PRs: user:${MY_LOGIN} (non-draft) ..."
-  parts+=("$(gh search prs "is:open is:pr is:draft:false user:${MY_LOGIN}" \
-    --json number,title,url,repository \
-    --limit "$limit" 2>/dev/null || echo '[]')")
+  # GitHub: exclude drafts with "-draft:true" (do not use "is:draft:false"; it can break the query).
+  echo "==> Searching open PRs: user:${MY_LOGIN} (excluding drafts) ..."
+  q="is:open is:pr -draft:true user:${MY_LOGIN}"
+  raw=$(gh search prs "$q" --json number,title,url,repository --limit "$limit" 2>/dev/null) || raw=''
+  chunk=$(normalize_gh_search_json "$raw")
+  combined=$(jq -n --argjson a "$combined" --argjson b "$chunk" '$a + $b')
 
   local org
   for org in "${MY_ORGS[@]}"; do
-    echo "==> Searching open PRs: org:${org} (non-draft) ..."
-    parts+=("$(gh search prs "is:open is:pr is:draft:false org:${org}" \
-      --json number,title,url,repository \
-      --limit "$limit" 2>/dev/null || echo '[]')")
+    echo "==> Searching open PRs: org:${org} (excluding drafts) ..."
+    q="is:open is:pr -draft:true org:${org}"
+    raw=$(gh search prs "$q" --json number,title,url,repository --limit "$limit" 2>/dev/null) || raw=''
+    chunk=$(normalize_gh_search_json "$raw")
+    combined=$(jq -n --argjson a "$combined" --argjson b "$chunk" '$a + $b')
   done
 
-  local combined='[]'
-  local p
-  for p in "${parts[@]}"; do
-    combined=$(jq -n --argjson a "$combined" --argjson b "$p" '$a + $b')
-  done
   echo "$combined" | jq 'unique_by(.url)'
 }
 
