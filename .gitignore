@@ -45,3 +45,4 @@ package-lock.json
 
 *.log
 .github/script/merge-branch-*.log
+cy-2026.isc
